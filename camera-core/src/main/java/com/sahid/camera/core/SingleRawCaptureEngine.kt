@@ -49,14 +49,18 @@ class SingleRawCaptureEngine(context: Context) {
             )
         }
 
+        val surfaceRotationDegrees = DeviceOrientationTracker.surfaceRotationDegrees
         return try {
-            RawCaptureOutcome.Success(captureJavaDng(lens))
+            RawCaptureOutcome.Success(captureJavaDng(lens, surfaceRotationDegrees))
         } catch (t: Throwable) {
             RawCaptureOutcome.Failure(t.message ?: t.javaClass.simpleName, t)
         }
     }
 
-    private fun captureJavaDng(lens: LensCapability): RawCaptureRecord {
+    private fun captureJavaDng(
+        lens: LensCapability,
+        surfaceRotationDegrees: Int,
+    ): RawCaptureRecord {
         val rawSize = chooseRawSize(lens.rawSizes)
         val thread = HandlerThread("AuroraDngCapture").apply { start() }
         val handler = Handler(thread.looper)
@@ -104,6 +108,9 @@ class SingleRawCaptureEngine(context: Context) {
             check(openLatch.await(OPEN_TIMEOUT_MS, TimeUnit.MILLISECONDS)) { "Timed out opening DNG camera" }
             openError.get()?.let { error(it) }
             val camera = cameraRef.get() ?: error("DNG camera did not open")
+            val characteristics = safeCharacteristics(lens.physicalCameraId ?: lens.cameraId)
+                ?: safeCharacteristics(lens.openCameraId)
+                ?: error("CameraCharacteristics unavailable for DNG")
 
             val output = OutputConfiguration(reader.surface).apply {
                 if (lens.accessPath == CameraAccessPath.PHYSICAL_VIA_LOGICAL) {
@@ -134,11 +141,18 @@ class SingleRawCaptureEngine(context: Context) {
             sessionError.get()?.let { error(it) }
             val session = sessionRef.get() ?: error("DNG session unavailable")
 
+            val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+            val captureOrientationDegrees = CameraOrientation.sensorToDeviceDegrees(
+                sensorOrientation = sensorOrientation,
+                isFrontFacing = lens.isFrontFacing,
+                surfaceRotationDegrees = surfaceRotationDegrees,
+            )
             val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(reader.surface)
                 set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
                 set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
                 set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+                runCatching { set(CaptureRequest.JPEG_ORIENTATION, captureOrientationDegrees) }
                 runCatching {
                     set(
                         CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE,
@@ -179,16 +193,13 @@ class SingleRawCaptureEngine(context: Context) {
                 "RAW/DNG metadata mismatch: image=${image.timestamp}, result=$resultTimestamp"
             }
 
-            val characteristics = safeCharacteristics(lens.physicalCameraId ?: lens.cameraId)
-                ?: safeCharacteristics(lens.openCameraId)
-                ?: error("CameraCharacteristics unavailable for DNG")
-
             AuroraDngWriter.write(
                 context = appContext,
                 lens = lens,
                 image = image,
                 characteristics = characteristics,
                 captureResult = captureResult,
+                surfaceRotationDegrees = surfaceRotationDegrees,
             )
         } finally {
             runCatching { sessionRef.get()?.close() }
