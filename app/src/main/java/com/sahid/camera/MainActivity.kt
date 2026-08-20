@@ -49,6 +49,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.sahid.camera.aurora.AuroraNative
+import com.sahid.camera.core.CameraAccessPath
 import com.sahid.camera.core.CameraCapabilityProbe
 import com.sahid.camera.core.CameraDiagnostics
 import com.sahid.camera.core.CameraPreviewController
@@ -155,6 +156,11 @@ private fun CameraScreen() {
             append(report.visibleLenses.size)
             append('/')
             append(report.candidates.map { it.cameraId }.distinct().size)
+            val nativeVisible = report.visibleLenses.count { it.accessPath == CameraAccessPath.NDK_DIRECT }
+            if (nativeVisible > 0) {
+                append(" • native ")
+                append(nativeVisible)
+            }
             val ndkOnly = report.discovery.ndkDirectIds.count {
                 it !in report.discovery.javaDirectIds
             }
@@ -281,7 +287,7 @@ private fun CameraScreen() {
             )
             Spacer(Modifier.height(6.dp))
             Text(
-                "Only real preview-qualified lenses are shown • all failed paths stay in diagnostics",
+                "Surface, native-NDK, and YUV-qualified lenses are shown • RAW-only stays diagnostic",
                 color = Color.Gray,
                 fontSize = 10.sp,
             )
@@ -302,6 +308,15 @@ private fun LensSelector(
         items(lenses, key = { it.stableId }) { lens ->
             val isSelected = selected?.stableId == lens.stableId
             val qualifiedRaw = lens.qualification.qualifiedRawSize
+            val previewLabel = when {
+                lens.accessPath == CameraAccessPath.NDK_DIRECT && lens.qualification.previewSessionQualified ->
+                    "NDK preview"
+                lens.qualification.previewSessionQualified -> "Camera2 preview"
+                lens.accessPath == CameraAccessPath.NDK_DIRECT && lens.qualification.yuvSessionQualified ->
+                    "NDK YUV"
+                lens.qualification.yuvSessionQualified -> "YUV preview"
+                else -> "Diagnostic only"
+            }
             Column(
                 modifier = Modifier
                     .padding(horizontal = 5.dp)
@@ -314,13 +329,16 @@ private fun LensSelector(
                 Text(lens.displayName, color = if (isSelected) Color.Black else Color.White, fontSize = 13.sp)
                 Text(
                     buildString {
-                        lens.focalLengthMm?.let { append(String.format("%.1fmm", it)) }
+                        append(previewLabel)
+                        lens.focalLengthMm?.let {
+                            append(" • ")
+                            append(String.format("%.1fmm", it))
+                        }
                         if (lens.rawUsable) {
-                            if (isNotEmpty()) append(" • ")
-                            append("RAW verified")
+                            append(" • RAW")
                             qualifiedRaw?.let { append(" ${it.width}×${it.height}") }
                         }
-                    }.ifBlank { "Preview verified" },
+                    },
                     color = if (isSelected) Color.DarkGray else Color.LightGray,
                     fontSize = 9.sp,
                 )
