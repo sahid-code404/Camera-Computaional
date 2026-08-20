@@ -38,10 +38,14 @@ import kotlin.math.max
  * stale is removed immediately and, for a direct camera ID, retried through NDK without forcing a
  * complete rediscovery pass. Routes are written to the learned cache only after a live frame is
  * observed by TextureView or ImageReader.
+ *
+ * Real-frame proof is also emitted to the UI immediately, eliminating SharedPreferences polling and
+ * allowing progressive discovery to wait for first preview instead of competing with camera startup.
  */
 class CameraPreviewController(
     private val context: Context,
     private val onStatus: (String) -> Unit = {},
+    private val onRouteProven: (LensCapability) -> Unit = {},
 ) {
     private val manager = context.getSystemService(CameraManager::class.java)
     private val learnedStore = LearnedLensStore(context)
@@ -433,13 +437,13 @@ class CameraPreviewController(
     private fun confirmSurfaceFrame() {
         val route = pendingSurfaceProof ?: return
         pendingSurfaceProof = null
-        learnedStore.upsertProvenRoute(route)
+        persistAndPublishProvenRoute(route)
     }
 
     private fun confirmYuvFrame(lens: LensCapability) {
         if (lastYuvProofStableId == lens.stableId) return
         lastYuvProofStableId = lens.stableId
-        learnedStore.upsertProvenRoute(
+        persistAndPublishProvenRoute(
             lens.copy(
                 qualification = LensQualification(
                     accessPathOpenQualified = true,
@@ -451,6 +455,16 @@ class CameraPreviewController(
                 )
             )
         )
+    }
+
+    private fun persistAndPublishProvenRoute(route: LensCapability) {
+        learnedStore.upsertProvenRoute(route)
+        val learnedRoute = route.copy(
+            discoverySources = route.discoverySources + CameraDiscoverySource.LEARNED_CACHE,
+        )
+        textureView?.post {
+            onRouteProven(learnedRoute)
+        }
     }
 
     private fun provenSurfaceRoute(lens: LensCapability): LensCapability = lens.copy(
