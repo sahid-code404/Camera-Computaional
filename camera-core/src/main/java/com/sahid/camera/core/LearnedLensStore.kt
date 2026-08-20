@@ -1,6 +1,7 @@
 package com.sahid.camera.core
 
 import android.content.Context
+import android.hardware.camera2.CameraCharacteristics
 import android.os.Build
 import android.util.Size
 import org.json.JSONArray
@@ -15,10 +16,9 @@ import org.json.JSONObject
  * so stale hardware state cannot silently produce frames from the wrong endpoint.
  */
 class LearnedLensStore(context: Context) {
-    private val prefs = context.applicationContext.getSharedPreferences(
-        PREFS_NAME,
-        Context.MODE_PRIVATE,
-    )
+    private val appContext = context.applicationContext
+    private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val legacyPrefs = appContext.getSharedPreferences(LEGACY_PREFS_NAME, Context.MODE_PRIVATE)
 
     data class Snapshot(
         val deepScanCompleted: Boolean,
@@ -27,35 +27,140 @@ class LearnedLensStore(context: Context) {
 
     fun load(): Snapshot {
         val raw = prefs.getString(Build.FINGERPRINT, null)
-            ?: return Snapshot(deepScanCompleted = false, routes = emptyList())
-        return runCatching {
-            val root = JSONObject(raw)
-            val routes = root.optJSONArray("routes")?.let(::parseRoutes).orEmpty()
-            Snapshot(
-                deepScanCompleted = root.optBoolean("deepScanCompleted", false),
-                routes = routes,
-            )
-        }.getOrElse {
-            Snapshot(deepScanCompleted = false, routes = emptyList())
+        if (raw != null) {
+            return runCatching {
+                val root = JSONObject(raw)
+                val routes = root.optJSONArray("routes")?.let(::parseRoutes).orEmpty()
+                Snapshot(
+                    deepScanCompleted = root.optBoolean("deepScanCompleted", false),
+                    routes = routes,
+                )
+            }.getOrElse {
+                Snapshot(deepScanCompleted = false, routes = emptyList())
+            }
         }
+
+        // Seamless upgrade from Phase-01 schema-v5 diagnostics. This prevents users who already
+        // completed the expensive hidden scan from paying that cost once more after this update.
+        return migrateLegacyQualificationCache()
+            ?: Snapshot(deepScanCompleted = false, routes = emptyList())
     }
 
     /** Save only routes that already produced a usable preview/YUV frame in the deep pass. */
     fun saveDeepScan(report: CameraQualificationReport) {
-        val payload = JSONObject()
-            .put("schemaVersion", 1)
-            .put("buildFingerprint", Build.FINGERPRINT)
-            .put("sdkInt", Build.VERSION.SDK_INT)
-            .put("deepScanCompleted", true)
-            .put("savedAtUnixMs", System.currentTimeMillis())
-            .put("routes", JSONArray().apply {
-                report.visibleLenses.forEach { lens -> put(routeJson(lens)) }
-            })
-        prefs.edit().putString(Build.FINGERPRINT, payload.toString()).apply()
+        saveRoutes(report.visibleLenses, deepScanCompleted = true)
     }
 
     fun clearCurrentBuild() {
         prefs.edit().remove(Build.FINGERPRINT).apply()
+    }
+
+    private fun saveRoutes(routes: List<LensCapability>, deepScanCompleted: Boolean) {
+        val payload = JSONObject()
+            .put("schemaVersion", 1)
+            .put("buildFingerprint", Build.FINGERPRINT)
+            .put("sdkInt", Build.VERSION.SDK_INT)
+            .put("deepScanCompleted", deepScanCompleted)
+            .put("savedAtUnixMs", System.currentTimeMillis())
+            .put("routes", JSONArray().apply {
+                routes.forEach { lens -> put(routeJson(lens)) }
+            })
+        prefs.edit().putString(Build.FINGERPRINT, payload.toString()).apply()
+    }
+
+    private fun migrateLegacyQualificationCache(): Snapshot? {
+        val raw = legacyPrefs.getString(Build.FINGERPRINT, null) ?: return null
+        val routes = runCatching {
+            val root = JSONObject(raw)
+            val candidates = root.optJSONArray("candidates") ?: return@runCatching emptyList()
+            buildList {
+                for (index in 0 until candidates.length()) {
+                    val item = candidates.optJSONObject(index) ?: continue
+                    if (!item.optBoolean("userVisible", false)) continue
+                    legacyCandidate(item)?.let(::add)
+                }
+            }
+                .groupBy { it.cameraId }
+                .values
+                .mapNotNull { paths -> paths.minByOrNull(::legacyRouteScore) }
+        }.getOrNull() ?: return null
+
+        // The old cache only exists after a complete Phase-01 qualification report was saved.
+        // Treat it as a completed deep scan even when the device had no hidden lenses.
+        saveRoutes(routes, deepScanCompleted = true)
+        return Snapshot(deepScanCompleted = true, routes = routes)
+    }
+
+    private fun legacyCandidate(item: JSONObject): LensCapability? {
+        val accessPath = runCatching {
+            CameraAccessPath.valueOf(item.getString("accessPath"))
+        }.getOrNull() ?: return null
+        val qualificationObject = item.optJSONObject("qualification") ?: JSONObject()
+        val previewSize = item.optJSONObject("largestPreviewSize")?.toSize()
+        val yuvSize = item.optJSONObject("largestYuvSize")?.toSize()
+        val rawSize = item.optJSONObject("largestRawSize")?.toSize()
+        val sources = buildSet {
+            val array = item.optJSONArray("discoverySources")
+            if (array != null) {
+                for (index in 0 until array.length()) {
+                    runCatching {
+                        CameraDiscoverySource.valueOf(array.getString(index))
+                    }.getOrNull()?.let(::add)
+                }
+            }
+            add(CameraDiscoverySource.LEARNED_CACHE)
+        }
+        return LensCapability(
+            cameraId = item.getString("cameraId"),
+            logicalCameraId = item.optString("logicalCameraId", item.getString("cameraId")),
+            physicalCameraId = item.optNullableString("physicalCameraId"),
+            accessPath = accessPath,
+            discoverySources = sources,
+            facing = when (item.optString("facing")) {
+                "back" -> CameraCharacteristics.LENS_FACING_BACK
+                "front" -> CameraCharacteristics.LENS_FACING_FRONT
+                "external" -> CameraCharacteristics.LENS_FACING_EXTERNAL
+                else -> null
+            },
+            displayName = item.optString("displayName", "ID ${item.getString("cameraId")}"),
+            focalLengthMm = item.optNullableDouble("focalLengthMm")?.toFloat(),
+            sensorWidthMm = item.optNullableDouble("sensorWidthMm")?.toFloat(),
+            sensorHeightMm = item.optNullableDouble("sensorHeightMm")?.toFloat(),
+            horizontalFovDegrees = item.optNullableDouble("horizontalFovDegrees")?.toFloat(),
+            rawSupported = item.optBoolean("rawAdvertised", false),
+            rawSizes = listOfNotNull(rawSize),
+            previewSizes = listOfNotNull(previewSize),
+            yuvSizes = listOfNotNull(yuvSize),
+            manualSensor = item.optBoolean("manualSensor", false),
+            burstCapture = item.optBoolean("burstCapture", false),
+            maxResolutionSensor = item.optBoolean("ultraHighResolutionSensor", false),
+            isLogicalMultiCamera = item.optBoolean("logicalMultiCamera", false),
+            usableForPreview = previewSize != null || yuvSize != null,
+            nativeHardwareLevel = item.optNullableInt("nativeHardwareLevel"),
+            nativeCharacteristicsStatus = item.optNullableInt("nativeCharacteristicsStatus"),
+            qualification = LensQualification(
+                accessPathOpenQualified = qualificationObject.optBoolean("accessPathOpenQualified", true),
+                previewSessionQualified = qualificationObject.optBoolean("previewSessionQualified", false),
+                yuvSessionQualified = qualificationObject.optBoolean("yuvSessionQualified", false),
+                rawSessionQualified = qualificationObject.optBoolean("rawSessionQualified", false),
+                qualifiedRawSize = qualificationObject.optJSONObject("qualifiedRawSize")?.toSize(),
+                detail = "Migrated from previous real-frame qualification",
+            ),
+        )
+    }
+
+    private fun legacyRouteScore(lens: LensCapability): Int {
+        val renderer = when {
+            lens.qualification.previewSessionQualified -> 0
+            lens.qualification.yuvSessionQualified -> 20
+            else -> 100
+        }
+        val access = when (lens.accessPath) {
+            CameraAccessPath.JAVA_DIRECT -> 0
+            CameraAccessPath.NDK_DIRECT -> 1
+            CameraAccessPath.PHYSICAL_VIA_LOGICAL -> 2
+        }
+        return renderer + access
     }
 
     private fun routeJson(lens: LensCapability): JSONObject = JSONObject().apply {
@@ -181,5 +286,6 @@ class LearnedLensStore(context: Context) {
 
     private companion object {
         const val PREFS_NAME = "camera_learned_lenses_v1"
+        const val LEGACY_PREFS_NAME = "camera_phase01_qualification_v5"
     }
 }
