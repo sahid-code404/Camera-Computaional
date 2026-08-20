@@ -59,6 +59,8 @@ import com.sahid.camera.core.InstantLensBootstrap
 import com.sahid.camera.core.LensCapability
 import com.sahid.camera.core.LensValueFilter
 import com.sahid.camera.core.ProgressiveLensDiscovery
+import com.sahid.camera.core.RawCaptureOutcome
+import com.sahid.camera.core.SingleRawCaptureEngine
 import com.sahid.camera.ui.CameraTheme
 import com.sahid.camera.update.OtaCheckResult
 import com.sahid.camera.update.OtaUpdateManager
@@ -133,8 +135,6 @@ private fun CameraScreen() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    // The hot path is intentionally tiny. A learned ROM reads only SharedPreferences; a fresh ROM
-    // performs only enough standard Java advertised metadata work to start the primary preview.
     val bootstrap = remember { InstantLensBootstrap.load(context) }
     var lenses by remember { mutableStateOf(bootstrap.lenses) }
     var selectedLens by remember {
@@ -157,6 +157,7 @@ private fun CameraScreen() {
         )
     }
     var lensScanBusy by remember { mutableStateOf(false) }
+    var rawCaptureBusy by remember { mutableStateOf(false) }
     var autoDiscoveryBusy by remember { mutableStateOf(false) }
     var autoDiscoveryStarted by remember { mutableStateOf(false) }
     var firstPreviewFrameSeen by remember { mutableStateOf(false) }
@@ -198,13 +199,8 @@ private fun CameraScreen() {
         }
     }
 
-    // Fast phones start discovery immediately after their first real preview frame. This avoids a
-    // fixed timer racing CameraService on slower OEMs. A safety timeout prevents a broken primary
-    // route from blocking discovery forever; if no public hint exists we start immediately.
     LaunchedEffect(firstPreviewFrameSeen, bootstrap.backgroundDiscoveryNeeded) {
-        if (firstPreviewFrameSeen) {
-            runAutomaticDiscoveryIfNeeded()
-        }
+        if (firstPreviewFrameSeen) runAutomaticDiscoveryIfNeeded()
     }
     LaunchedEffect(Unit) {
         if (!bootstrap.backgroundDiscoveryNeeded) return@LaunchedEffect
@@ -212,7 +208,6 @@ private fun CameraScreen() {
         runAutomaticDiscoveryIfNeeded()
     }
 
-    // OTA/network work is independent of camera startup and never triggers camera discovery.
     LaunchedEffect(Unit) {
         otaBusy = true
         otaResult = OtaUpdateManager.checkForUpdate().also { result ->
@@ -256,7 +251,7 @@ private fun CameraScreen() {
                 .background(Color(0x66000000))
                 .padding(horizontal = 16.dp, vertical = 14.dp),
         ) {
-            Text("Camera • Aurora Phase 01", color = Color.White, fontSize = 16.sp)
+            Text("Camera • Aurora Phase 02", color = Color.White, fontSize = 16.sp)
             Text(status, color = Color.LightGray, fontSize = 12.sp)
             Text(nativeStatus, color = Color.Gray, fontSize = 11.sp)
             Text(
@@ -274,7 +269,7 @@ private fun CameraScreen() {
                 .padding(top = 12.dp, bottom = 22.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            LensSelector(lenses, selectedLens) { selectedLens = it }
+            LensSelector(lenses, selectedLens) { if (!rawCaptureBusy) selectedLens = it }
             Spacer(Modifier.height(12.dp))
             ModeRow()
             Spacer(Modifier.height(10.dp))
@@ -285,10 +280,8 @@ private fun CameraScreen() {
                     }
                 }
 
-                // Advanced fallback only. Normal discovery is automatic; deep rescan retains
-                // direct-open probing for OEMs that hide the camera even from metadata lookup.
                 Button(
-                    enabled = !lensScanBusy,
+                    enabled = !lensScanBusy && !rawCaptureBusy,
                     onClick = {
                         scope.launch {
                             lensScanBusy = true
@@ -314,7 +307,7 @@ private fun CameraScreen() {
                 }
 
                 Button(
-                    enabled = !otaBusy,
+                    enabled = !otaBusy && !rawCaptureBusy,
                     onClick = {
                         val current = otaResult
                         if (current is OtaCheckResult.Available) {
@@ -362,22 +355,54 @@ private fun CameraScreen() {
                 }
             }
             Spacer(Modifier.height(10.dp))
+
+            val shutterLens = selectedLens
+            val rawAvailable = shutterLens?.let { it.rawSupported && it.rawSizes.isNotEmpty() } == true
             Box(
                 modifier = Modifier
                     .size(76.dp)
-                    .border(4.dp, Color.White, CircleShape)
+                    .border(4.dp, if (rawAvailable) Color.White else Color.Gray, CircleShape)
                     .padding(6.dp)
                     .clip(CircleShape)
-                    .background(Color.White),
+                    .background(if (rawAvailable && !rawCaptureBusy) Color.White else Color.DarkGray)
+                    .clickable(enabled = rawAvailable && !rawCaptureBusy) {
+                        val captureLens = selectedLens ?: return@clickable
+                        scope.launch {
+                            rawCaptureBusy = true
+                            selectedLens = null
+                            status = "Capturing canonical RAW_SENSOR…"
+                            try {
+                                // CameraPreviewController closes synchronously on disposal; this tiny grace
+                                // period lets vendor CameraService finish the device-close transition.
+                                delay(RAW_PREVIEW_RELEASE_DELAY_MS)
+                                when (val outcome = withContext(Dispatchers.IO) {
+                                    SingleRawCaptureEngine(context).capture(captureLens)
+                                }) {
+                                    is RawCaptureOutcome.Success -> {
+                                        val record = outcome.record
+                                        status = "RAW saved • ${record.width}×${record.height} • ${record.file.name}"
+                                    }
+                                    is RawCaptureOutcome.Unsupported -> status = outcome.reason
+                                    is RawCaptureOutcome.Failure -> status = "RAW failed • ${outcome.reason}"
+                                }
+                            } finally {
+                                selectedLens = lenses.firstOrNull { it.stableId == captureLens.stableId }
+                                    ?: lenses.firstOrNull { it.cameraId == captureLens.cameraId }
+                                    ?: captureLens
+                                rawCaptureBusy = false
+                            }
+                        }
+                    },
             )
             Spacer(Modifier.height(6.dp))
             Text(
-                if (autoDiscoveryBusy) {
-                    "Preview live • finding useful extra lenses in background…"
-                } else if (bootstrap.backgroundDiscoveryNeeded && !autoDiscoveryStarted) {
-                    "Preview first • lens discovery waits for first real frame"
-                } else {
-                    "Instant preview • useful lens cache • helper aliases hidden automatically"
+                when {
+                    rawCaptureBusy -> "RAW_SENSOR capture • pairing image + sensor metadata…"
+                    rawAvailable -> "Phase 02A • canonical RAW_SENSOR ready"
+                    autoDiscoveryBusy -> "Preview live • finding useful extra lenses in background…"
+                    bootstrap.backgroundDiscoveryNeeded && !autoDiscoveryStarted ->
+                        "Preview first • lens discovery waits for first real frame"
+                    else -> "RAW unavailable on selected lens"
                 },
                 color = Color.Gray,
                 fontSize = 10.sp,
@@ -398,7 +423,6 @@ private fun LensSelector(
     ) {
         items(lenses, key = { it.stableId }) { lens ->
             val isSelected = selected?.stableId == lens.stableId
-            val qualifiedRaw = lens.qualification.qualifiedRawSize
             val hidden = CameraDiscoverySource.HIDDEN_ID_PROBE in lens.discoverySources
             val learned = CameraDiscoverySource.LEARNED_CACHE in lens.discoverySources
             val ready = CameraDiscoverySource.CANDIDATE_CACHE in lens.discoverySources
@@ -440,9 +464,10 @@ private fun LensSelector(
                             append(" • ")
                             append(String.format("%.1fmm", it))
                         }
-                        if (lens.rawUsable) {
+                        if (lens.rawSupported && lens.rawSizes.isNotEmpty()) {
+                            val rawSize = lens.rawSizes.maxByOrNull { it.width.toLong() * it.height.toLong() }
                             append(" • RAW")
-                            qualifiedRaw?.let { append(" ${it.width}×${it.height}") }
+                            rawSize?.let { append(" ${it.width}×${it.height}") }
                         }
                     },
                     color = if (isSelected) Color.DarkGray else Color.LightGray,
@@ -517,10 +542,11 @@ private fun CameraPreview(
 private fun shareDiagnostics(context: Context, diagnosticsJson: String) {
     val sendIntent = Intent(Intent.ACTION_SEND).apply {
         type = "application/json"
-        putExtra(Intent.EXTRA_SUBJECT, "Camera Aurora Phase 01 diagnostics")
+        putExtra(Intent.EXTRA_SUBJECT, "Camera Aurora Phase 02 diagnostics")
         putExtra(Intent.EXTRA_TEXT, diagnosticsJson)
     }
     context.startActivity(Intent.createChooser(sendIntent, "Share Camera diagnostics"))
 }
 
 private const val AUTO_DISCOVERY_SAFETY_DELAY_MS = 1_500L
+private const val RAW_PREVIEW_RELEASE_DELAY_MS = 150L
