@@ -1,5 +1,6 @@
 #include <jni.h>
 
+#include <camera/NdkCameraDevice.h>
 #include <camera/NdkCameraManager.h>
 #include <camera/NdkCameraMetadata.h>
 #include <media/NdkImage.h>
@@ -264,6 +265,9 @@ CameraRecord readCameraRecord(
     return record;
 }
 
+void deepDeviceDisconnected(void*, ACameraDevice*) {}
+void deepDeviceError(void*, ACameraDevice*, int) {}
+
 }  // namespace
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -275,7 +279,7 @@ Java_com_sahid_camera_aurora_NativeCameraEnumerator_nativeSearchHiddenNumericJso
     ACameraManager* manager = ACameraManager_create();
     if (manager == nullptr) {
         return env->NewStringUTF(
-            "{\"maxId\":0,\"attemptedCount\":0,\"advertisedIds\":[],\"validCameras\":[],\"hiddenIds\":[],\"rejectedStatuses\":{}}");
+            "{\"maxId\":0,\"attemptedCount\":0,\"advertisedIds\":[],\"validCameras\":[],\"hiddenIds\":[],\"rejectedStatuses\":{},\"directOpenStatuses\":{},\"directOpenSucceededIds\":[]}");
     }
 
     std::set<std::string> advertised;
@@ -308,6 +312,30 @@ Java_com_sahid_camera_aurora_NativeCameraEnumerator_nativeSearchHiddenNumericJso
         if (metadata != nullptr) ACameraMetadata_free(metadata);
     }
 
+    // Fast MotionCam-style fallback: reuse the SAME native manager and synchronously try only
+    // IDs whose metadata was filtered. Invalid IDs fail immediately; real hidden endpoints are
+    // opened and closed without hundreds of Java callback timeouts or manager allocations.
+    std::map<std::string, int32_t> directOpenStatuses;
+    std::vector<std::string> directOpenSucceededIds;
+    ACameraDevice_StateCallbacks callbacks{};
+    callbacks.context = nullptr;
+    callbacks.onDisconnected = deepDeviceDisconnected;
+    callbacks.onError = deepDeviceError;
+
+    for (const auto& [id, metadataStatus] : rejectedStatuses) {
+        (void) metadataStatus;
+        ACameraDevice* device = nullptr;
+        const camera_status_t openStatus =
+            ACameraManager_openCamera(manager, id.c_str(), &callbacks, &device);
+        directOpenStatuses[id] = static_cast<int32_t>(openStatus);
+        if (openStatus == ACAMERA_OK && device != nullptr) {
+            directOpenSucceededIds.push_back(id);
+        }
+        if (device != nullptr) {
+            ACameraDevice_close(device);
+        }
+    }
+
     std::vector<std::string> advertisedIds(advertised.begin(), advertised.end());
     std::ostringstream out;
     out << "{\"maxId\":" << maxId
@@ -329,7 +357,16 @@ Java_com_sahid_camera_aurora_NativeCameraEnumerator_nativeSearchHiddenNumericJso
         firstRejected = false;
         out << '"' << jsonEscape(id) << "\":" << status;
     }
-    out << "}}";
+    out << "},\"directOpenStatuses\":{";
+    bool firstOpen = true;
+    for (const auto& [id, status] : directOpenStatuses) {
+        if (!firstOpen) out << ',';
+        firstOpen = false;
+        out << '"' << jsonEscape(id) << "\":" << status;
+    }
+    out << "},\"directOpenSucceededIds\":";
+    appendStringArray(out, directOpenSucceededIds);
+    out << '}';
 
     if (cameraIds != nullptr) ACameraManager_deleteCameraIdList(cameraIds);
     ACameraManager_delete(manager);
