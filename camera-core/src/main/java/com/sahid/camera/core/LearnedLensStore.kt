@@ -64,6 +64,31 @@ class LearnedLensStore(context: Context) {
         saveRoutes(merged, deepScanCompleted = current.deepScanCompleted)
     }
 
+    /** Save a route only after the live preview path has actually produced a frame. */
+    fun upsertProvenRoute(route: LensCapability) {
+        if (!route.userVisible) return
+        val learnedRoute = route.copy(
+            discoverySources = route.discoverySources + CameraDiscoverySource.LEARNED_CACHE,
+        )
+        val current = load()
+        val merged = (current.routes.filterNot { it.stableId == learnedRoute.stableId } + learnedRoute)
+            .filter { it.userVisible }
+        saveRoutes(merged, deepScanCompleted = current.deepScanCompleted)
+    }
+
+    /**
+     * Drop one stale access route without forgetting the rest of the phone's learned lens map.
+     * A failed Java route can therefore be replaced by an NDK route for the same camera ID.
+     */
+    fun removeRoute(stableId: String) {
+        val current = load()
+        if (current.routes.none { it.stableId == stableId }) return
+        saveRoutes(
+            routes = current.routes.filterNot { it.stableId == stableId },
+            deepScanCompleted = current.deepScanCompleted,
+        )
+    }
+
     fun clearCurrentBuild() {
         prefs.edit().remove(Build.FINGERPRINT).apply()
     }
