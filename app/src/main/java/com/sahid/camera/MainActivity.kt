@@ -108,7 +108,7 @@ private fun PermissionScreen(onGrant: () -> Unit) {
             Text("Camera permission is required", color = Color.White, fontSize = 20.sp)
             Spacer(Modifier.height(16.dp))
             Text(
-                "Phase 01 opens and validates real Camera2 sessions before a lens is shown.",
+                "Phase 01 compares Java Camera2, NDK Camera2, and logical physical-camera topology before runtime qualification.",
                 color = Color.LightGray,
             )
             Spacer(Modifier.height(24.dp))
@@ -123,7 +123,7 @@ private fun CameraScreen() {
     var lenses by remember { mutableStateOf<List<LensCapability>>(emptyList()) }
     var selectedLens by remember { mutableStateOf<LensCapability?>(null) }
     var diagnosticsJson by remember { mutableStateOf<String?>(null) }
-    var status by remember { mutableStateOf("Qualifying Camera2 lens sessions…") }
+    var status by remember { mutableStateOf("Comparing Java + NDK + logical camera discovery…") }
     val nativeStatus = remember {
         runCatching {
             "Aurora ${AuroraNative.version()} • native self-test ${if (AuroraNative.selfTest()) "OK" else "FAILED"}"
@@ -138,10 +138,22 @@ private fun CameraScreen() {
         selectedLens = report.visibleLenses.firstOrNull { !it.isFrontFacing }
             ?: report.visibleLenses.firstOrNull()
         diagnosticsJson = CameraDiagnostics.toJson(report)
-        status = if (report.visibleLenses.isEmpty()) {
-            "No runtime-qualified Camera2 lens sessions"
-        } else {
-            "${report.visibleLenses.size}/${report.candidates.size} lens candidate(s) qualified"
+        status = buildString {
+            append("Java ")
+            append(report.discovery.javaDirectIds.size)
+            append(" • NDK ")
+            append(report.discovery.ndkDirectIds.size)
+            append(" • qualified ")
+            append(report.visibleLenses.size)
+            append('/')
+            append(report.candidates.map { it.cameraId }.distinct().size)
+            val ndkOnly = report.discovery.ndkDirectIds.count {
+                it !in report.discovery.javaDirectIds
+            }
+            if (ndkOnly > 0) {
+                append(" • NDK-only ")
+                append(ndkOnly)
+            }
         }
     }
 
@@ -194,7 +206,7 @@ private fun CameraScreen() {
             )
             Spacer(Modifier.height(6.dp))
             Text(
-                "Only runtime-qualified lenses are shown • shutter remains disabled in Phase 01",
+                "Only real preview-qualified lenses are shown • all failed paths stay in diagnostics",
                 color = Color.Gray,
                 fontSize = 10.sp,
             )
