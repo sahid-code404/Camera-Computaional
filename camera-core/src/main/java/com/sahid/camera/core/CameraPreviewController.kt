@@ -7,7 +7,6 @@ import android.graphics.Bitmap
 import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
-import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCaptureSession
@@ -30,18 +29,6 @@ import java.util.concurrent.Executor
 import kotlin.math.abs
 import kotlin.math.max
 
-/**
- * Live preview dispatcher optimized for instant cached startup.
- *
- * JAVA_DIRECT and PHYSICAL_VIA_LOGICAL use Java Camera2. NDK_DIRECT stays native all the way
- * through ACameraManager/ACameraDevice/ACameraCaptureSession. A learned Java route that becomes
- * stale is removed immediately and, for a direct camera ID, retried through NDK without forcing a
- * complete rediscovery pass. Routes are written to the learned cache only after a live frame is
- * observed by TextureView or ImageReader.
- *
- * Real-frame proof is also emitted to the UI immediately, eliminating SharedPreferences polling and
- * allowing progressive discovery to wait for first preview instead of competing with camera startup.
- */
 class CameraPreviewController(
     private val context: Context,
     private val onStatus: (String) -> Unit = {},
@@ -135,12 +122,10 @@ class CameraPreviewController(
             val openGeneration = generation
             handler.post {
                 if (!started || generation != openGeneration || hasActiveRoute()) return@post
-                if (lens.qualification.previewSessionQualified) {
-                    startNativeSurfacePreview(lens)
-                } else if (lens.qualification.yuvSessionQualified) {
-                    startNativeYuvPreview(lens)
-                } else {
-                    onStatus("${lens.displayName}: no renderable NDK preview path")
+                when {
+                    lens.qualification.previewSessionQualified -> startNativeSurfacePreview(lens)
+                    lens.qualification.yuvSessionQualified -> startNativeYuvPreview(lens)
+                    else -> onStatus("${lens.displayName}: no renderable NDK preview path")
                 }
             }
             return
@@ -148,10 +133,7 @@ class CameraPreviewController(
 
         val openGeneration = generation
         onStatus("Opening ${lens.displayName}")
-
         try {
-            // Handler overload is intentionally used instead of the API-28 Executor overload.
-            // A number of vendor Camera2 implementations are more reliable on this original path.
             manager.openCamera(lens.openCameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
                     if (openGeneration != generation || !started) {
@@ -159,38 +141,34 @@ class CameraPreviewController(
                         return
                     }
                     cameraDevice = camera
-                    if (lens.qualification.previewSessionQualified) {
-                        createSurfacePreviewSession(camera, lens)
-                    } else if (lens.qualification.yuvSessionQualified) {
-                        createJavaYuvPreviewSession(camera, lens)
-                    } else {
-                        camera.close()
-                        cameraDevice = null
-                        handleJavaRouteFailure(lens, "No renderable Java preview path")
+                    when {
+                        lens.qualification.previewSessionQualified -> createSurfacePreviewSession(camera, lens)
+                        lens.qualification.yuvSessionQualified -> createJavaYuvPreviewSession(camera, lens)
+                        else -> {
+                            camera.close()
+                            cameraDevice = null
+                            handleJavaRouteFailure(lens, "No renderable Java preview path")
+                        }
                     }
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
                     camera.close()
                     if (cameraDevice === camera) cameraDevice = null
-                    if (openGeneration == generation && started) {
-                        handleJavaRouteFailure(lens, "Camera disconnected")
-                    }
+                    if (openGeneration == generation && started) handleJavaRouteFailure(lens, "Camera disconnected")
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
                     camera.close()
                     if (cameraDevice === camera) cameraDevice = null
-                    if (openGeneration == generation && started) {
-                        handleJavaRouteFailure(lens, "Camera error $error")
-                    }
+                    if (openGeneration == generation && started) handleJavaRouteFailure(lens, "Camera error $error")
                 }
             }, handler)
-        } catch (security: SecurityException) {
+        } catch (_: SecurityException) {
             onStatus("Camera permission denied")
         } catch (access: CameraAccessException) {
             handleJavaRouteFailure(lens, "Camera unavailable: ${access.reason}")
-        } catch (illegal: IllegalArgumentException) {
+        } catch (_: IllegalArgumentException) {
             handleJavaRouteFailure(lens, "Java route rejected")
         } catch (t: Throwable) {
             handleJavaRouteFailure(lens, "Camera open failed: ${t.javaClass.simpleName}")
@@ -198,9 +176,7 @@ class CameraPreviewController(
     }
 
     private fun handleJavaRouteFailure(lens: LensCapability, reason: String) {
-        if (lens.learnedFromCache) {
-            learnedStore.removeRoute(lens.stableId)
-        }
+        if (lens.learnedFromCache) learnedStore.removeRoute(lens.stableId)
         if (
             lens.accessPath == CameraAccessPath.JAVA_DIRECT &&
             nativeFallbackAttemptedForCameraId != lens.cameraId &&
@@ -212,8 +188,7 @@ class CameraPreviewController(
                 logicalCameraId = lens.cameraId,
                 physicalCameraId = null,
                 accessPath = CameraAccessPath.NDK_DIRECT,
-                discoverySources = (lens.discoverySources - CameraDiscoverySource.LEARNED_CACHE) +
-                    CameraDiscoverySource.NDK_DIRECT,
+                discoverySources = (lens.discoverySources - CameraDiscoverySource.LEARNED_CACHE) + CameraDiscoverySource.NDK_DIRECT,
                 qualification = LensQualification(
                     accessPathOpenQualified = false,
                     previewSessionQualified = lens.previewSizes.isNotEmpty(),
@@ -249,14 +224,15 @@ class CameraPreviewController(
         if (!start.started) {
             surface.release()
             if (lens.yuvSizes.isNotEmpty()) {
-                val yuvFallback = lens.copy(
-                    qualification = lens.qualification.copy(
-                        previewSessionQualified = false,
-                        yuvSessionQualified = true,
-                        detail = "NDK Surface failed; trying YUV",
+                startNativeYuvPreview(
+                    lens.copy(
+                        qualification = lens.qualification.copy(
+                            previewSessionQualified = false,
+                            yuvSessionQualified = true,
+                            detail = "NDK Surface failed; trying YUV",
+                        )
                     )
                 )
-                startNativeYuvPreview(yuvFallback)
             } else {
                 onStatus("NDK preview failed at ${start.stageLabel}: ${start.status}")
             }
@@ -270,11 +246,10 @@ class CameraPreviewController(
 
     private fun startNativeYuvPreview(lens: LensCapability) {
         val view = textureView ?: return
-        val size = chooseYuvPreviewSize(lens.yuvSizes)
-            ?: run {
-                onStatus("${lens.displayName}: YUV size unavailable")
-                return
-            }
+        val size = chooseYuvPreviewSize(lens.yuvSizes) ?: run {
+            onStatus("${lens.displayName}: YUV size unavailable")
+            return
+        }
         configureTransform(lens, view.width, view.height, size)
         val reader = createYuvReader(size, lens) ?: return
         val start = NativeCameraSession.startPreview(lens.cameraId, reader.surface)
@@ -292,14 +267,12 @@ class CameraPreviewController(
         val view = textureView ?: return
         val texture = view.surfaceTexture ?: return
         val previewSize = choosePreviewSize(lens.previewSizes, view.width, view.height)
-
         texture.setDefaultBufferSize(previewSize.width, previewSize.height)
         configureTransform(lens, view.width, view.height, previewSize)
 
         val surface = Surface(texture)
         activeSurface = surface
         val output = physicalOutput(surface, lens)
-
         val config = SessionConfiguration(
             SessionConfiguration.SESSION_REGULAR,
             listOf(output),
@@ -333,7 +306,6 @@ class CameraPreviewController(
                 }
             },
         )
-
         try {
             camera.createCaptureSession(config)
         } catch (t: Throwable) {
@@ -344,16 +316,14 @@ class CameraPreviewController(
 
     private fun createJavaYuvPreviewSession(camera: CameraDevice, lens: LensCapability) {
         val view = textureView ?: return
-        val size = chooseYuvPreviewSize(lens.yuvSizes)
-            ?: run {
-                onStatus("${lens.displayName}: YUV size unavailable")
-                return
-            }
+        val size = chooseYuvPreviewSize(lens.yuvSizes) ?: run {
+            onStatus("${lens.displayName}: YUV size unavailable")
+            return
+        }
         configureTransform(lens, view.width, view.height, size)
         val reader = createYuvReader(size, lens) ?: return
         yuvReader = reader
         val output = physicalOutput(reader.surface, lens)
-
         val config = SessionConfiguration(
             SessionConfiguration.SESSION_REGULAR,
             listOf(output),
@@ -386,7 +356,6 @@ class CameraPreviewController(
                 }
             },
         )
-
         try {
             camera.createCaptureSession(config)
         } catch (t: Throwable) {
@@ -459,12 +428,8 @@ class CameraPreviewController(
 
     private fun persistAndPublishProvenRoute(route: LensCapability) {
         learnedStore.upsertProvenRoute(route)
-        val learnedRoute = route.copy(
-            discoverySources = route.discoverySources + CameraDiscoverySource.LEARNED_CACHE,
-        )
-        textureView?.post {
-            onRouteProven(learnedRoute)
-        }
+        val learnedRoute = route.copy(discoverySources = route.discoverySources + CameraDiscoverySource.LEARNED_CACHE)
+        textureView?.post { onRouteProven(learnedRoute) }
     }
 
     private fun provenSurfaceRoute(lens: LensCapability): LensCapability = lens.copy(
@@ -511,7 +476,6 @@ class CameraPreviewController(
                 val yValue = yBuffer.get(yIndex).toInt() and 0xff
                 val uValue = (uBuffer.get(uIndex).toInt() and 0xff) - 128
                 val vValue = (vBuffer.get(vIndex).toInt() and 0xff) - 128
-
                 val c = max(0, yValue - 16)
                 val r = clamp8((298 * c + 409 * vValue + 128) shr 8)
                 val g = clamp8((298 * c - 100 * uValue - 208 * vValue + 128) shr 8)
@@ -540,10 +504,7 @@ class CameraPreviewController(
 
     private fun clamp8(value: Int): Int = value.coerceIn(0, 255)
 
-    private fun applyAutoControls(
-        builder: CaptureRequest.Builder,
-        lens: LensCapability,
-    ) {
+    private fun applyAutoControls(builder: CaptureRequest.Builder, lens: LensCapability) {
         builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
         builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
         val afModes = runCatching {
@@ -576,15 +537,12 @@ class CameraPreviewController(
         } else {
             16.0 / 9.0
         }
-
-        val bounded = sizes.filter { size ->
-            max(size.width, size.height) <= 1920 && minOf(size.width, size.height) <= 1080
+        val bounded = sizes.filter {
+            max(it.width, it.height) <= 1920 && minOf(it.width, it.height) <= 1080
         }.ifEmpty { sizes }
-
         return bounded.minWithOrNull(
-            compareBy<Size> { size ->
-                abs(size.width.toDouble() / size.height.toDouble() - targetRatio)
-            }.thenByDescending { size -> size.width.toLong() * size.height.toLong() }
+            compareBy<Size> { abs(it.width.toDouble() / it.height.toDouble() - targetRatio) }
+                .thenByDescending { it.width.toLong() * it.height.toLong() }
         ) ?: sizes.first()
     }
 
@@ -596,6 +554,11 @@ class CameraPreviewController(
         return (bounded.ifEmpty { sizes }).maxByOrNull { it.width.toLong() * it.height.toLong() }
     }
 
+    /**
+     * TextureView transforms map the sensor buffer into the portrait-locked app. The previous code
+     * rotated in the sensor's direction; for display we need the inverse rotation. This path is shared
+     * by Java Surface, NDK Surface, Java YUV and NDK YUV previews.
+     */
     private fun configureTransform(
         lens: LensCapability,
         viewWidth: Int,
@@ -618,7 +581,6 @@ class CameraPreviewController(
             Surface.ROTATION_270 -> 270
             else -> 0
         }
-
         val relativeRotation = if (lens.isFrontFacing) {
             (sensorOrientation + displayDegrees) % 360
         } else {
@@ -626,25 +588,19 @@ class CameraPreviewController(
         }
 
         val rotated = relativeRotation == 90 || relativeRotation == 270
-        val bufferWidth = if (rotated) size.height.toFloat() else size.width.toFloat()
-        val bufferHeight = if (rotated) size.width.toFloat() else size.height.toFloat()
-
-        val viewRect = RectF(0f, 0f, viewWidth.toFloat(), viewHeight.toFloat())
-        val bufferRect = RectF(0f, 0f, bufferWidth, bufferHeight)
-        val centerX = viewRect.centerX()
-        val centerY = viewRect.centerY()
-        bufferRect.offset(centerX - bufferRect.centerX(), centerY - bufferRect.centerY())
-
-        val matrix = Matrix()
-        matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
+        val rotatedWidth = if (rotated) size.height.toFloat() else size.width.toFloat()
+        val rotatedHeight = if (rotated) size.width.toFloat() else size.height.toFloat()
         val scale = max(
-            viewHeight.toFloat() / bufferHeight,
-            viewWidth.toFloat() / bufferWidth,
+            viewWidth.toFloat() / rotatedWidth.coerceAtLeast(1f),
+            viewHeight.toFloat() / rotatedHeight.coerceAtLeast(1f),
         )
-        matrix.postScale(scale, scale, centerX, centerY)
-        matrix.postRotate(relativeRotation.toFloat(), centerX, centerY)
-        if (lens.isFrontFacing) {
-            matrix.postScale(-1f, 1f, centerX, centerY)
+
+        val matrix = Matrix().apply {
+            setTranslate(-size.width / 2f, -size.height / 2f)
+            postRotate(-relativeRotation.toFloat())
+            if (lens.isFrontFacing) postScale(-1f, 1f)
+            postScale(scale, scale)
+            postTranslate(viewWidth / 2f, viewHeight / 2f)
         }
         view.setTransform(matrix)
     }
@@ -655,24 +611,19 @@ class CameraPreviewController(
     private fun closeCamera() {
         pendingSurfaceProof = null
         lastYuvProofStableId = null
-
         if (nativeSessionHandle != 0L) {
             runCatching { NativeCameraSession.stop(nativeSessionHandle) }
             nativeSessionHandle = 0L
         }
-
         runCatching { captureSession?.stopRepeating() }
         runCatching { captureSession?.abortCaptures() }
         runCatching { captureSession?.close() }
         captureSession = null
-
         runCatching { cameraDevice?.close() }
         cameraDevice = null
-
         runCatching { yuvReader?.setOnImageAvailableListener(null, null) }
         runCatching { yuvReader?.close() }
         yuvReader = null
-
         runCatching { activeSurface?.release() }
         activeSurface = null
         lastYuvRenderNs = 0L
