@@ -22,7 +22,7 @@ android {
         buildConfigField(
             "String",
             "OTA_MANIFEST_URL",
-            "\"https://github.com/sahid-code404/Camera-Computaional/releases/download/phase01-latest/update.json\"",
+            "\"https://github.com/sahid-code404/Camera-Computaional/releases/download/phase02-latest/update.json\"",
         )
     }
 
