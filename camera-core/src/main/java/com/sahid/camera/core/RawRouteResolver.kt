@@ -3,11 +3,11 @@ package com.sahid.camera.core
 import android.content.Context
 
 /**
- * Resolves the best RAW_SENSOR access profile for a selected user-facing lens family.
+ * Resolves the best standards-correct DNG capture profile for a selected lens family.
  *
- * Preview and RAW do not have to use the same API route. A public Java preview default can retain
- * an NDK or physical-via-logical alias that is the only profile advertising RAW. Phase 02 therefore
- * chooses RAW from the complete cached family rather than assuming the visible route is sufficient.
+ * Phase 02 requires a public Camera2 CaptureResult + CameraCharacteristics pair so Android's
+ * DngCreator can write one real DNG without fabricating metadata. NDK-only profiles remain useful
+ * for preview/discovery, but are not selected for DNG until Aurora has a complete native DNG writer.
  */
 class RawRouteResolver(context: Context) {
     private val appContext = context.applicationContext
@@ -26,21 +26,25 @@ class RawRouteResolver(context: Context) {
         }
 
         val candidates = (family?.routes ?: listOf(selected))
-            .filter { it.rawSupported && it.rawSizes.isNotEmpty() }
+            .filter {
+                it.rawSupported &&
+                    it.rawSizes.isNotEmpty() &&
+                    it.accessPath != CameraAccessPath.NDK_DIRECT
+            }
         if (candidates.isEmpty()) return null
 
         return candidates.minWithOrNull(
             compareBy<LensCapability> { route ->
-                when {
-                    route.stableId == selected.stableId -> 0
-                    route.learnedFromCache -> 1
-                    else -> 2
-                }
-            }.thenBy { route ->
                 when (route.accessPath) {
                     CameraAccessPath.JAVA_DIRECT -> 0
-                    CameraAccessPath.NDK_DIRECT -> 1
-                    CameraAccessPath.PHYSICAL_VIA_LOGICAL -> 2
+                    CameraAccessPath.PHYSICAL_VIA_LOGICAL -> 1
+                    CameraAccessPath.NDK_DIRECT -> 2
+                }
+            }.thenBy { route ->
+                when {
+                    route.learnedFromCache -> 0
+                    route.stableId == selected.stableId -> 1
+                    else -> 2
                 }
             }.thenByDescending { route ->
                 route.rawSizes.maxOfOrNull { it.width.toLong() * it.height.toLong() } ?: 0L
