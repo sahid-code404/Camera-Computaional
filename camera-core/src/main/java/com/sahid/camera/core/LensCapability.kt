@@ -14,6 +14,7 @@ enum class CameraDiscoverySource {
     NDK_DIRECT,
     LOGICAL_PHYSICAL,
     HIDDEN_ID_PROBE,
+    DEEP_OPEN_PROBE,
 }
 
 data class LensCapability(
@@ -60,6 +61,9 @@ data class LensCapability(
 
     val isFrontFacing: Boolean
         get() = facing == CameraCharacteristics.LENS_FACING_FRONT
+
+    val deepOpenDiscovered: Boolean
+        get() = CameraDiscoverySource.DEEP_OPEN_PROBE in discoverySources
 
     /**
      * A lens is visible only when Camera has a renderer for the qualified output.
