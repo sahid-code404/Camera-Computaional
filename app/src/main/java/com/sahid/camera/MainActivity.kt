@@ -34,6 +34,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -53,7 +54,10 @@ import com.sahid.camera.core.CameraDiagnostics
 import com.sahid.camera.core.CameraPreviewController
 import com.sahid.camera.core.LensCapability
 import com.sahid.camera.ui.CameraTheme
+import com.sahid.camera.update.OtaCheckResult
+import com.sahid.camera.update.OtaUpdateManager
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
@@ -120,10 +124,14 @@ private fun PermissionScreen(onGrant: () -> Unit) {
 @Composable
 private fun CameraScreen() {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var lenses by remember { mutableStateOf<List<LensCapability>>(emptyList()) }
     var selectedLens by remember { mutableStateOf<LensCapability?>(null) }
     var diagnosticsJson by remember { mutableStateOf<String?>(null) }
     var status by remember { mutableStateOf("Comparing Java + NDK + logical camera discovery…") }
+    var otaResult by remember { mutableStateOf<OtaCheckResult?>(null) }
+    var otaBusy by remember { mutableStateOf(false) }
+    var otaMessage by remember { mutableStateOf("Checking OTA…") }
     val nativeStatus = remember {
         runCatching {
             "Aurora ${AuroraNative.version()} • native self-test ${if (AuroraNative.selfTest()) "OK" else "FAILED"}"
@@ -157,6 +165,18 @@ private fun CameraScreen() {
         }
     }
 
+    LaunchedEffect(Unit) {
+        otaBusy = true
+        otaResult = OtaUpdateManager.checkForUpdate().also { result ->
+            otaMessage = when (result) {
+                is OtaCheckResult.Available -> "OTA ${result.update.versionName} available"
+                is OtaCheckResult.UpToDate -> "OTA up to date • ${result.versionName}"
+                is OtaCheckResult.Failed -> "OTA check unavailable"
+            }
+        }
+        otaBusy = false
+    }
+
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         selectedLens?.let { lens ->
             CameraPreview(
@@ -176,6 +196,11 @@ private fun CameraScreen() {
             Text("Camera • Aurora Phase 01", color = Color.White, fontSize = 16.sp)
             Text(status, color = Color.LightGray, fontSize = 12.sp)
             Text(nativeStatus, color = Color.Gray, fontSize = 11.sp)
+            Text(
+                "${BuildConfig.APPLICATION_ID} • build ${BuildConfig.VERSION_CODE} • $otaMessage",
+                color = Color.Gray,
+                fontSize = 10.sp,
+            )
         }
 
         Column(
@@ -190,12 +215,62 @@ private fun CameraScreen() {
             Spacer(Modifier.height(12.dp))
             ModeRow()
             Spacer(Modifier.height(10.dp))
-            diagnosticsJson?.let { diagnostics ->
-                Button(onClick = { shareDiagnostics(context, diagnostics) }) {
-                    Text("Share diagnostics", fontSize = 11.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                diagnosticsJson?.let { diagnostics ->
+                    Button(onClick = { shareDiagnostics(context, diagnostics) }) {
+                        Text("Share diagnostics", fontSize = 11.sp)
+                    }
                 }
-                Spacer(Modifier.height(10.dp))
+
+                Button(
+                    enabled = !otaBusy,
+                    onClick = {
+                        val current = otaResult
+                        if (current is OtaCheckResult.Available) {
+                            if (!OtaUpdateManager.canRequestPackageInstalls(context)) {
+                                otaMessage = "Allow Camera to install updates, then tap Update again"
+                                OtaUpdateManager.openUnknownSourcesSettings(context)
+                            } else {
+                                scope.launch {
+                                    otaBusy = true
+                                    otaMessage = "Downloading ${current.update.versionName}…"
+                                    val apk = OtaUpdateManager.downloadAndVerify(context, current.update)
+                                    otaBusy = false
+                                    apk.onSuccess { file ->
+                                        otaMessage = "Opening Android installer…"
+                                        OtaUpdateManager.launchInstaller(context, file)
+                                    }.onFailure { error ->
+                                        otaMessage = "OTA download failed: ${error.message ?: error.javaClass.simpleName}"
+                                    }
+                                }
+                            }
+                        } else {
+                            scope.launch {
+                                otaBusy = true
+                                otaMessage = "Checking OTA…"
+                                otaResult = OtaUpdateManager.checkForUpdate().also { result ->
+                                    otaMessage = when (result) {
+                                        is OtaCheckResult.Available -> "OTA ${result.update.versionName} available"
+                                        is OtaCheckResult.UpToDate -> "OTA up to date • ${result.versionName}"
+                                        is OtaCheckResult.Failed -> "OTA check failed: ${result.detail}"
+                                    }
+                                }
+                                otaBusy = false
+                            }
+                        }
+                    },
+                ) {
+                    Text(
+                        when {
+                            otaBusy -> "Please wait…"
+                            otaResult is OtaCheckResult.Available -> "Update"
+                            else -> "Check update"
+                        },
+                        fontSize = 11.sp,
+                    )
+                }
             }
+            Spacer(Modifier.height(10.dp))
             Box(
                 modifier = Modifier
                     .size(76.dp)
