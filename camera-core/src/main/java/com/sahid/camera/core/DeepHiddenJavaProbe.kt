@@ -12,6 +12,7 @@ import java.io.Closeable
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 data class JavaDirectOpenProbe(
@@ -46,10 +47,15 @@ class DeepHiddenJavaProbe(context: Context) : Closeable {
         val latch = CountDownLatch(1)
         val cameraRef = AtomicReference<CameraDevice?>()
         val detailRef = AtomicReference("open timed out")
+        val finished = AtomicBoolean(false)
 
         try {
             manager.openCamera(cameraId, executor, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
+                    if (finished.get()) {
+                        runCatching { camera.close() }
+                        return
+                    }
                     cameraRef.set(camera)
                     detailRef.set("opened")
                     latch.countDown()
@@ -57,17 +63,20 @@ class DeepHiddenJavaProbe(context: Context) : Closeable {
 
                 override fun onDisconnected(camera: CameraDevice) {
                     detailRef.set("disconnected")
+                    cameraRef.compareAndSet(camera, null)
                     runCatching { camera.close() }
                     latch.countDown()
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
                     detailRef.set("error $error")
+                    cameraRef.compareAndSet(camera, null)
                     runCatching { camera.close() }
                     latch.countDown()
                 }
             })
         } catch (t: Throwable) {
+            finished.set(true)
             return JavaDirectOpenProbe(
                 cameraId = cameraId,
                 opened = false,
@@ -77,6 +86,7 @@ class DeepHiddenJavaProbe(context: Context) : Closeable {
 
         val boundedTimeout = timeoutMs.coerceIn(MIN_OPEN_TIMEOUT_MS, MAX_OPEN_TIMEOUT_MS)
         val signalled = latch.await(boundedTimeout, TimeUnit.MILLISECONDS)
+        finished.set(true)
         val camera = cameraRef.getAndSet(null)
         runCatching { camera?.close() }
         return JavaDirectOpenProbe(
