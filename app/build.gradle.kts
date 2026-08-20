@@ -5,7 +5,7 @@ plugins {
 }
 
 val otaVersionCode = System.getenv("CAMERA_VERSION_CODE")?.toIntOrNull() ?: 1
-val otaVersionName = System.getenv("CAMERA_VERSION_NAME") ?: "0.1.0-phase01-dev"
+val otaVersionName = System.getenv("CAMERA_VERSION_NAME") ?: "0.2.0-phase02-dev"
 
 android {
     namespace = "com.sahid.camera"
