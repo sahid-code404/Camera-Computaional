@@ -136,8 +136,8 @@ object LensFamilyResolver {
         familyRoutes: List<LensCapability>,
         allUsableRoutes: List<LensCapability>,
     ): Boolean {
-        val familyIds = familyRoutes.mapTo(setOf()) { it.cameraId }
-        val visibleTargetIds = allUsableRoutes.mapTo(setOf()) { it.cameraId }
+        val familyIds = familyRoutes.mapTo(mutableSetOf()) { it.cameraId }
+        val visibleTargetIds = allUsableRoutes.mapTo(mutableSetOf()) { it.cameraId }
 
         return familyRoutes.any { route ->
             route.cameraId in familyIds &&
