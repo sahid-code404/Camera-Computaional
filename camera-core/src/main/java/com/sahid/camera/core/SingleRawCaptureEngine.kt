@@ -100,7 +100,7 @@ class SingleRawCaptureEngine(context: Context) {
         val cameraRef = AtomicReference<CameraDevice?>()
         val openError = AtomicReference<String?>()
         val openLatch = CountDownLatch(1)
-        try {
+        return try {
             manager.openCamera(lens.openCameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
                     cameraRef.set(camera)
@@ -331,7 +331,6 @@ class SingleRawCaptureEngine(context: Context) {
         put("availableApertures", floatArrayJson(chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES)))
         put("referenceIlluminant1", chars.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT1) ?: JSONObject.NULL)
         put("referenceIlluminant2", chars.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT2) ?: JSONObject.NULL)
-        put("baseGainFactor", chars.get(CameraCharacteristics.SENSOR_BASE_GAIN_FACTOR)?.let(::rationalJson) ?: JSONObject.NULL)
         put("blackLevelPattern", chars.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN)?.let { pattern ->
             JSONArray().apply {
                 for (y in 0..1) for (x in 0..1) put(pattern.getOffsetForIndex(x, y))
