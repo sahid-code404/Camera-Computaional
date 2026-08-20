@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.view.MotionEvent
 import android.view.TextureView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -56,6 +57,7 @@ import com.sahid.camera.core.CameraCapabilityProbe
 import com.sahid.camera.core.CameraDiagnostics
 import com.sahid.camera.core.CameraDiscoverySource
 import com.sahid.camera.core.CameraPreviewController
+import com.sahid.camera.core.FocusMeteringPoint
 import com.sahid.camera.core.InstantLensBootstrap
 import com.sahid.camera.core.LensCapability
 import com.sahid.camera.core.LensValueFilter
@@ -168,6 +170,7 @@ private fun CameraScreen() {
     var otaResult by remember { mutableStateOf<OtaCheckResult?>(null) }
     var otaBusy by remember { mutableStateOf(false) }
     var otaMessage by remember { mutableStateOf("Checking OTA…") }
+    var focusPointsByCameraId by remember { mutableStateOf<Map<String, FocusMeteringPoint>>(emptyMap()) }
     val nativeStatus = remember {
         runCatching {
             "Aurora ${AuroraNative.version()} • native self-test ${if (AuroraNative.selfTest()) "OK" else "FAILED"}"
@@ -229,6 +232,9 @@ private fun CameraScreen() {
             CameraPreview(
                 lens = lens,
                 onStatus = { status = it },
+                onFocusPoint = { point ->
+                    focusPointsByCameraId = focusPointsByCameraId + (lens.cameraId to point)
+                },
                 onRouteProven = { proven ->
                     firstPreviewFrameSeen = true
                     val previousStableId = selectedLens?.stableId
@@ -387,6 +393,7 @@ private fun CameraScreen() {
                             Toast.makeText(context, message, Toast.LENGTH_LONG).show()
                             return@clickable
                         }
+                        val requestedFocusPoint = focusPointsByCameraId[selectedFamilyLens.cameraId]
 
                         scope.launch {
                             rawCaptureBusy = true
@@ -400,7 +407,10 @@ private fun CameraScreen() {
                             try {
                                 delay(RAW_PREVIEW_RELEASE_DELAY_MS)
                                 when (val outcome = withContext(Dispatchers.IO) {
-                                    SingleRawCaptureEngine(context).capture(captureRoute)
+                                    SingleRawCaptureEngine(context).capture(
+                                        lens = captureRoute,
+                                        focusPoint = requestedFocusPoint,
+                                    )
                                 }) {
                                     is RawCaptureOutcome.Success -> {
                                         val record = outcome.record
@@ -435,10 +445,10 @@ private fun CameraScreen() {
             Spacer(Modifier.height(6.dp))
             Text(
                 when {
-                    rawCaptureBusy -> "RAW_SENSOR capture • pairing image + sensor metadata…"
+                    rawCaptureBusy -> "RAW_SENSOR capture • autofocus lock + image/metadata pairing…"
                     rawAvailable && rawRoute?.stableId != familyLens?.stableId ->
                         "Phase 02A • RAW available through internal family profile"
-                    rawAvailable -> "Phase 02A • canonical RAW_SENSOR ready"
+                    rawAvailable -> "Phase 02A • canonical RAW_SENSOR ready • tap preview to focus"
                     autoDiscoveryBusy -> "Preview live • finding useful extra lenses in background…"
                     bootstrap.backgroundDiscoveryNeeded && !autoDiscoveryStarted ->
                         "Preview first • lens discovery waits for first real frame"
@@ -544,24 +554,42 @@ private fun CameraPreview(
     lens: LensCapability,
     onStatus: (String) -> Unit,
     onRouteProven: (LensCapability) -> Unit,
+    onFocusPoint: (FocusMeteringPoint) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val latestStatus = rememberUpdatedState(onStatus)
     val latestRouteProven = rememberUpdatedState(onRouteProven)
+    val latestFocusPoint = rememberUpdatedState(onFocusPoint)
     val controller = remember {
         CameraPreviewController(
             context = context.applicationContext,
             onStatus = { latestStatus.value(it) },
             onRouteProven = { latestRouteProven.value(it) },
+            onFocusPoint = { latestFocusPoint.value(it) },
         )
     }
 
     AndroidView(
         modifier = modifier,
         factory = { viewContext ->
-            TextureView(viewContext).also(controller::attach)
+            TextureView(viewContext).also { view ->
+                view.isClickable = true
+                view.setOnTouchListener { _, event ->
+                    when (event.actionMasked) {
+                        MotionEvent.ACTION_DOWN -> true
+                        MotionEvent.ACTION_UP -> {
+                            controller.tapToFocus(event.x, event.y)
+                            view.performClick()
+                            true
+                        }
+                        MotionEvent.ACTION_CANCEL -> true
+                        else -> true
+                    }
+                }
+                controller.attach(view)
+            }
         },
         update = {
             controller.setLens(lens)
