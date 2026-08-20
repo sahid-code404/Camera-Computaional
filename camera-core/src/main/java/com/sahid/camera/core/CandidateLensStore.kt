@@ -7,59 +7,86 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Per-ROM cache for useful metadata-discovered lenses that have not produced a real frame yet.
+ * Per-ROM cache for useful metadata-discovered camera routes that have not produced a real frame.
  *
- * This is intentionally separate from [LearnedLensStore]. A candidate can be restored instantly on
- * the next launch, but it never gains LEARNED_CACHE status until CameraPreviewController observes
- * an actual TextureView/ImageReader frame.
+ * Important: this store keeps every endpoint/profile, including aliases that are hidden by the
+ * normal selector. [LensFamilyResolver] decides which route is the default for each user-facing lens
+ * family. Keeping aliases here means restart never destroys alternate routes that may later be
+ * useful as compatibility fallbacks.
  */
 class CandidateLensStore(context: Context) {
     private val prefs = context.applicationContext
         .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
-    fun load(): List<LensCapability> {
-        val raw = prefs.getString(Build.FINGERPRINT, null) ?: return emptyList()
-        return runCatching {
-            val root = JSONObject(raw)
-            root.optJSONArray("routes")?.let(::parseRoutes).orEmpty()
-        }.getOrDefault(emptyList())
-    }
+    private data class Snapshot(
+        val routes: List<LensCapability>,
+        val autoScanCompleted: Boolean,
+    )
 
-    fun replace(routes: List<LensCapability>) {
-        val filtered = LensValueFilter.filterForSelector(
-            routes
-                .filter { it.userVisible && !it.learnedFromCache }
-                .map { route ->
-                    route.copy(
-                        discoverySources = (route.discoverySources - CameraDiscoverySource.LEARNED_CACHE) +
-                            CameraDiscoverySource.CANDIDATE_CACHE,
-                    )
-                }
-        )
-        save(filtered)
+    fun load(): List<LensCapability> = loadSnapshot().routes
+
+    /**
+     * A completed automatic metadata pass is valid only for the current Build.FINGERPRINT because
+     * this SharedPreferences payload is keyed by that fingerprint. This lets normal launches skip
+     * the 0..255 pass entirely after the first successful discovery.
+     */
+    fun hasCompletedAutoScan(): Boolean = loadSnapshot().autoScanCompleted
+
+    fun replace(routes: List<LensCapability>, autoScanCompleted: Boolean = true) {
+        val retained = routes
+            .filter { it.userVisible && !it.learnedFromCache }
+            .map { route ->
+                route.copy(
+                    discoverySources = (route.discoverySources - CameraDiscoverySource.LEARNED_CACHE) +
+                        CameraDiscoverySource.CANDIDATE_CACHE,
+                )
+            }
+            .groupBy { it.stableId }
+            .values
+            .mapNotNull { sameRoute -> sameRoute.maxByOrNull(::metadataCompletenessScore) }
+        save(retained, autoScanCompleted = autoScanCompleted)
     }
 
     fun removeCamera(cameraId: String) {
-        val current = load()
-        if (current.none { it.cameraId == cameraId }) return
-        save(current.filterNot { it.cameraId == cameraId })
+        val current = loadSnapshot()
+        if (current.routes.none { it.cameraId == cameraId }) return
+        save(
+            current.routes.filterNot { it.cameraId == cameraId },
+            autoScanCompleted = current.autoScanCompleted,
+        )
     }
 
     fun removeRoute(stableId: String) {
-        val current = load()
-        if (current.none { it.stableId == stableId }) return
-        save(current.filterNot { it.stableId == stableId })
+        val current = loadSnapshot()
+        if (current.routes.none { it.stableId == stableId }) return
+        save(
+            current.routes.filterNot { it.stableId == stableId },
+            autoScanCompleted = current.autoScanCompleted,
+        )
     }
 
     fun clearCurrentBuild() {
         prefs.edit().remove(Build.FINGERPRINT).apply()
     }
 
-    private fun save(routes: List<LensCapability>) {
+    private fun loadSnapshot(): Snapshot {
+        val raw = prefs.getString(Build.FINGERPRINT, null)
+            ?: return Snapshot(emptyList(), autoScanCompleted = false)
+        return runCatching {
+            val root = JSONObject(raw)
+            Snapshot(
+                routes = root.optJSONArray("routes")?.let(::parseRoutes).orEmpty(),
+                autoScanCompleted = root.optBoolean("autoScanCompleted", false),
+            )
+        }.getOrDefault(Snapshot(emptyList(), autoScanCompleted = false))
+    }
+
+    private fun save(routes: List<LensCapability>, autoScanCompleted: Boolean) {
         val payload = JSONObject()
-            .put("schemaVersion", 1)
+            .put("schemaVersion", 2)
             .put("buildFingerprint", Build.FINGERPRINT)
             .put("savedAtUnixMs", System.currentTimeMillis())
+            .put("autoScanCompleted", autoScanCompleted)
             .put("routes", JSONArray().apply {
                 routes.forEach { put(routeJson(it)) }
             })
@@ -93,6 +120,7 @@ class CandidateLensStore(context: Context) {
         put("burstCapture", lens.burstCapture)
         put("maxResolutionSensor", lens.maxResolutionSensor)
         put("logicalMultiCamera", lens.isLogicalMultiCamera)
+        put("logicalPhysicalIds", JSONArray(lens.logicalPhysicalIds.toList().sorted()))
         put("nativeHardwareLevel", lens.nativeHardwareLevel ?: JSONObject.NULL)
         put("nativeCharacteristicsStatus", lens.nativeCharacteristicsStatus ?: JSONObject.NULL)
         put("previewHint", lens.qualification.previewSessionQualified)
@@ -144,6 +172,7 @@ class CandidateLensStore(context: Context) {
                     burstCapture = item.optBoolean("burstCapture", false),
                     maxResolutionSensor = item.optBoolean("maxResolutionSensor", false),
                     isLogicalMultiCamera = item.optBoolean("logicalMultiCamera", false),
+                    logicalPhysicalIds = item.optStringSet("logicalPhysicalIds"),
                     usableForPreview = true,
                     nativeHardwareLevel = item.optNullableInt("nativeHardwareLevel"),
                     nativeCharacteristicsStatus = item.optNullableInt("nativeCharacteristicsStatus"),
@@ -153,11 +182,23 @@ class CandidateLensStore(context: Context) {
                         yuvSessionQualified = yuvHint,
                         rawSessionQualified = false,
                         qualifiedRawSize = null,
-                        detail = "Persistent metadata candidate; first live frame still proves route",
+                        detail = "Persistent metadata profile; first live frame still proves route",
                     ),
                 )
             )
         }
+    }
+
+    private fun metadataCompletenessScore(lens: LensCapability): Int {
+        var score = 0
+        if (lens.focalLengthMm != null) score += 4
+        if (lens.sensorWidthMm != null && lens.sensorHeightMm != null) score += 4
+        if (lens.horizontalFovDegrees != null) score += 2
+        if (lens.previewSizes.isNotEmpty()) score += 3
+        if (lens.yuvSizes.isNotEmpty()) score += 2
+        if (lens.rawSizes.isNotEmpty()) score += 1
+        if (lens.logicalPhysicalIds.isNotEmpty()) score += 3
+        return score
     }
 
     private fun sizeArray(values: List<Size>): JSONArray = JSONArray().apply {
@@ -174,6 +215,16 @@ class CandidateLensStore(context: Context) {
                 val width = item.optInt("width", 0)
                 val height = item.optInt("height", 0)
                 if (width > 0 && height > 0) add(Size(width, height))
+            }
+        }
+    }
+
+    private fun JSONObject.optStringSet(name: String): Set<String> {
+        val values = optJSONArray(name) ?: return emptySet()
+        return buildSet {
+            for (index in 0 until values.length()) {
+                val value = values.optString(index, "")
+                if (value.isNotBlank()) add(value)
             }
         }
     }
