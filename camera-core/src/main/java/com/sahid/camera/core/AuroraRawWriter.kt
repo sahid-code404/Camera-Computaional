@@ -94,7 +94,7 @@ object AuroraRawWriter {
             .put("captureMetadata", dynamicMetadata)
 
         val metadataBytes = metadata.toString().toByteArray(Charsets.UTF_8)
-        val displayFile = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        val canonicalFile = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             writeMediaStore(context, fileName, metadataBytes, packet.bytes)
             File("/${CameraStoragePolicy.CANONICAL_RAW_RELATIVE_PATH}", fileName)
         } else {
@@ -115,7 +115,8 @@ object AuroraRawWriter {
         }.getOrNull()
 
         return RawCaptureRecord(
-            file = displayFile,
+            file = previewFile ?: canonicalFile,
+            canonicalFile = canonicalFile,
             previewFile = previewFile,
             cameraId = lens.cameraId,
             accessPath = lens.accessPath,
