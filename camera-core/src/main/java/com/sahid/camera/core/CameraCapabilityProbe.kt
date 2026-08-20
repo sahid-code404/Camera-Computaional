@@ -18,14 +18,14 @@ import kotlin.math.tan
 /**
  * Phase-01 universal camera discovery and runtime qualification.
  *
- * Candidate discovery intentionally combines three independent views:
+ * Candidate discovery combines four views:
  *  1. Java CameraManager.cameraIdList
  *  2. NDK ACameraManager_getCameraIdList
  *  3. logical-camera physicalCameraIds topology
+ *  4. bounded numeric hidden-ID metadata probing through ACameraManager_getCameraCharacteristics
  *
- * Every Java and NDK direct route is represented independently, even when both APIs return
- * the same ID. That matters on devices where Java can enumerate an ID but only the NDK route
- * can actually create a useful session.
+ * Advertised lists are evidence, not an authority boundary. A metadata-valid hidden ID is
+ * allowed to reach the same real frame qualification used by normal direct IDs.
  */
 class CameraCapabilityProbe(context: Context) {
     private val appContext = context.applicationContext
@@ -103,26 +103,50 @@ class CameraCapabilityProbe(context: Context) {
             .sorted()
         val javaDirectSet = javaDirectIds.toSet()
 
-        val ndkInfos = runCatching { NativeCameraEnumerator.enumerate() }
+        val ndkListedInfos = runCatching { NativeCameraEnumerator.enumerate() }
             .getOrDefault(emptyList())
-        val ndkById = ndkInfos.associateBy { it.id }
-        val ndkDirectIds = ndkInfos.map { it.id }.distinct().sorted()
+        val ndkDirectIds = ndkListedInfos.map { it.id }.distinct().sorted()
         val ndkDirectSet = ndkDirectIds.toSet()
 
-        val logicalTopology = javaDirectIds.mapNotNull { logicalId ->
+        // Metadata-only bounded scan. Invalid IDs are never opened. Only metadata-valid IDs
+        // below proceed into Java/NDK runtime qualification.
+        val hiddenProbe = runCatching {
+            NativeCameraEnumerator.searchHiddenNumericIds(HIDDEN_SCAN_MAX_ID)
+        }.getOrElse {
+            com.sahid.camera.aurora.HiddenCameraProbeResult.empty(HIDDEN_SCAN_MAX_ID)
+        }
+        val hiddenMetadataIds = hiddenProbe.validIds.distinct().sortedWith(::cameraIdComparator)
+        val hiddenDiscoveredIds = hiddenMetadataIds
+            .filterNot { it in javaDirectSet || it in ndkDirectSet }
+            .distinct()
+            .sortedWith(::cameraIdComparator)
+        val hiddenDiscoveredSet = hiddenDiscoveredIds.toSet()
+
+        // The hidden probe reads the same NDK metadata but additionally extracts logical
+        // physical IDs. Prefer that richer record when both sources describe the same ID.
+        val ndkById = buildMap<String, NativeCameraInfo> {
+            ndkListedInfos.forEach { put(it.id, it) }
+            hiddenProbe.validCameras.forEach { put(it.id, it) }
+        }
+
+        val javaTopology = javaDirectIds.mapNotNull { logicalId ->
             val children = safeCharacteristics(logicalId)
                 ?.physicalCameraIds
                 ?.toList()
                 ?.distinct()
-                ?.sorted()
+                ?.sortedWith(::cameraIdComparator)
                 .orEmpty()
             if (children.isEmpty()) null else logicalId to children
         }.toMap()
+        val hiddenTopology = hiddenProbe.logicalTopology.mapValues { (_, children) ->
+            children.distinct().sortedWith(::cameraIdComparator)
+        }
+        val logicalTopology = mergeTopology(javaTopology, hiddenTopology)
 
         val candidates = mutableListOf<LensCapability>()
 
-        // Java and NDK paths remain independent. Do not collapse a shared ID before runtime
-        // qualification: Java may enumerate/open differently from ACameraManager on OEM builds.
+        // Java and NDK listed paths remain independent. Do not collapse a shared ID before
+        // runtime qualification: OEMs can expose different behavior through each API route.
         javaDirectIds.forEach { cameraId ->
             val sources = buildSet {
                 add(CameraDiscoverySource.JAVA_DIRECT)
@@ -157,14 +181,55 @@ class CameraCapabilityProbe(context: Context) {
             )?.let(candidates::add)
         }
 
-        // Keep a physical-via-logical candidate even when the same child is also directly
-        // enumerated. Runtime qualification decides which access route is reliable.
+        // Hidden IDs are not required to appear in either advertised list. The NDK metadata
+        // scan itself is enough to create a direct native candidate; actual frames remain the
+        // final gate. If Java characteristics are also retrievable, test that route separately.
+        hiddenDiscoveredIds.forEach { cameraId ->
+            val native = ndkById[cameraId] ?: return@forEach
+            val commonSources = buildSet {
+                add(CameraDiscoverySource.HIDDEN_ID_PROBE)
+                if (cameraId in ndkDirectSet) add(CameraDiscoverySource.NDK_DIRECT)
+                if (cameraId in javaDirectSet) add(CameraDiscoverySource.JAVA_DIRECT)
+            }
+            buildCapability(
+                cameraId = cameraId,
+                logicalCameraId = cameraId,
+                physicalCameraId = null,
+                chars = safeCharacteristics(cameraId),
+                native = native,
+                accessPath = CameraAccessPath.NDK_DIRECT,
+                discoverySources = commonSources,
+                isLogicalMultiCamera = logicalTopology[cameraId].orEmpty().isNotEmpty(),
+            )?.let(candidates::add)
+
+            val hiddenJavaChars = safeCharacteristics(cameraId)
+            if (hiddenJavaChars != null) {
+                buildCapability(
+                    cameraId = cameraId,
+                    logicalCameraId = cameraId,
+                    physicalCameraId = null,
+                    chars = hiddenJavaChars,
+                    native = native,
+                    accessPath = CameraAccessPath.JAVA_DIRECT,
+                    discoverySources = commonSources + CameraDiscoverySource.JAVA_DIRECT,
+                    isLogicalMultiCamera = logicalTopology[cameraId].orEmpty().isNotEmpty(),
+                )?.let(candidates::add)
+            }
+        }
+
+        // Keep physical-via-logical candidates where the logical parent is accessible through
+        // Java Camera2. Hidden logical topology is still retained even when Java cannot open the
+        // parent; that diagnostic tells us whether an NDK physical-output route is needed next.
         logicalTopology.forEach { (logicalId, physicalIds) ->
+            val logicalChars = safeCharacteristics(logicalId) ?: return@forEach
             physicalIds.forEach { physicalId ->
                 val sources = buildSet {
                     add(CameraDiscoverySource.LOGICAL_PHYSICAL)
                     if (physicalId in javaDirectSet) add(CameraDiscoverySource.JAVA_DIRECT)
                     if (physicalId in ndkDirectSet) add(CameraDiscoverySource.NDK_DIRECT)
+                    if (physicalId in hiddenDiscoveredSet || logicalId in hiddenDiscoveredSet) {
+                        add(CameraDiscoverySource.HIDDEN_ID_PROBE)
+                    }
                 }
                 buildCapability(
                     cameraId = physicalId,
@@ -177,6 +242,10 @@ class CameraCapabilityProbe(context: Context) {
                     isLogicalMultiCamera = true,
                 )?.let(candidates::add)
             }
+            // Keep the read alive as evidence that this parent is Java-addressable even when
+            // no child candidate can be constructed from independently readable metadata.
+            @Suppress("UNUSED_VARIABLE")
+            val javaAddressableLogical = logicalChars
         }
 
         return DiscoveryResult(
@@ -184,6 +253,12 @@ class CameraCapabilityProbe(context: Context) {
                 javaDirectIds = javaDirectIds,
                 ndkDirectIds = ndkDirectIds,
                 logicalTopology = logicalTopology,
+                hiddenProbeMaxNumericId = hiddenProbe.maxNumericId,
+                hiddenProbeAttemptedCount = hiddenProbe.attemptedCount,
+                hiddenMetadataIds = hiddenMetadataIds,
+                hiddenDiscoveredIds = hiddenDiscoveredIds,
+                hiddenLogicalTopology = hiddenTopology,
+                hiddenRejectedStatuses = hiddenProbe.rejectedStatuses,
             ),
             candidates = candidates.distinctBy { it.stableId },
         )
@@ -267,11 +342,23 @@ class CameraCapabilityProbe(context: Context) {
                 CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_BURST_CAPTURE in capabilities,
             maxResolutionSensor =
                 CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_ULTRA_HIGH_RESOLUTION_SENSOR in capabilities,
-            isLogicalMultiCamera = isLogicalMultiCamera,
+            isLogicalMultiCamera = isLogicalMultiCamera || native?.logicalMultiCamera == true,
             usableForPreview = previewSizes.isNotEmpty() || yuvSizes.isNotEmpty(),
             nativeHardwareLevel = native?.hardwareLevel,
             nativeCharacteristicsStatus = native?.characteristicsStatus,
         )
+    }
+
+    private fun mergeTopology(
+        first: Map<String, List<String>>,
+        second: Map<String, List<String>>,
+    ): Map<String, List<String>> = buildMap {
+        (first.keys + second.keys).forEach { logicalId ->
+            val children = (first[logicalId].orEmpty() + second[logicalId].orEmpty())
+                .distinct()
+                .sortedWith(::cameraIdComparator)
+            if (children.isNotEmpty()) put(logicalId, children)
+        }
     }
 
     private fun collapseUserLensIdentities(
@@ -414,8 +501,23 @@ class CameraCapabilityProbe(context: Context) {
     private fun safeCharacteristics(cameraId: String): CameraCharacteristics? =
         runCatching { manager.getCameraCharacteristics(cameraId) }.getOrNull()
 
+    private fun cameraIdComparator(left: String, right: String): Int {
+        val leftNumber = left.toIntOrNull()
+        val rightNumber = right.toIntOrNull()
+        return when {
+            leftNumber != null && rightNumber != null -> leftNumber.compareTo(rightNumber)
+            leftNumber != null -> -1
+            rightNumber != null -> 1
+            else -> left.compareTo(right)
+        }
+    }
+
     private data class DiscoveryResult(
         val snapshot: CameraDiscoverySnapshot,
         val candidates: List<LensCapability>,
     )
+
+    private companion object {
+        const val HIDDEN_SCAN_MAX_ID = NativeCameraEnumerator.DEFAULT_HIDDEN_SCAN_MAX_ID
+    }
 }
