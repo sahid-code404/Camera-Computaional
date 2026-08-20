@@ -34,6 +34,7 @@ class CameraPreviewController(
     private val context: Context,
     private val onStatus: (String) -> Unit = {},
     private val onRouteProven: (LensCapability) -> Unit = {},
+    private val onFocusPoint: (FocusMeteringPoint) -> Unit = {},
 ) {
     private val manager = context.getSystemService(CameraManager::class.java)
     private val learnedStore = LearnedLensStore(context)
@@ -46,6 +47,7 @@ class CameraPreviewController(
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
     private var activeSurface: Surface? = null
+    private var repeatingSurface: Surface? = null
     private var yuvReader: ImageReader? = null
     private var nativeSessionHandle: Long = 0L
     private var started = false
@@ -55,6 +57,7 @@ class CameraPreviewController(
     private var lastYuvProofStableId: String? = null
     private var nativeFallbackAttemptedForCameraId: String? = null
     private var orientationRegistered = false
+    private var activeFocusPoint: FocusMeteringPoint? = null
     @Volatile private var physicalSurfaceRotationDegrees = DeviceOrientationTracker.surfaceRotationDegrees
 
     private val orientationCallback: (Int) -> Unit = { degrees ->
@@ -102,6 +105,7 @@ class CameraPreviewController(
     fun setLens(lens: LensCapability?) {
         if (selectedLens?.stableId == lens?.stableId) return
         selectedLens = lens
+        activeFocusPoint = null
         nativeFallbackAttemptedForCameraId = null
         restartCamera()
     }
@@ -125,6 +129,83 @@ class CameraPreviewController(
         textureView?.surfaceTextureListener = null
         textureView = null
         cameraThread.quitSafely()
+    }
+
+    /**
+     * Focus the subject underneath a view-space tap.
+     *
+     * The mapped physical-sensor point is always published, including NDK preview routes. This is
+     * important because an NDK-only aux preview can still use a standards-correct physical-via-
+     * logical Camera2 route for the final RAW exposure; SingleRawCaptureEngine reuses this point.
+     */
+    fun tapToFocus(viewX: Float, viewY: Float) {
+        val view = textureView ?: return
+        val lens = selectedLens ?: return
+        val characteristics = runCatching {
+            manager.getCameraCharacteristics(lens.physicalCameraId ?: lens.cameraId)
+        }.getOrElse {
+            runCatching { manager.getCameraCharacteristics(lens.openCameraId) }.getOrNull()
+        } ?: return
+
+        val point = FocusMetering.fromViewTap(
+            view = view,
+            characteristics = characteristics,
+            isFrontFacing = lens.isFrontFacing,
+            surfaceRotationDegrees = physicalSurfaceRotationDegrees,
+            viewX = viewX,
+            viewY = viewY,
+        )
+        activeFocusPoint = point
+        view.post { onFocusPoint(point) }
+
+        // Native preview currently exposes no request-reconfiguration JNI. The point still follows
+        // the shutter into the Java physical RAW route, so final RAW focus remains user controlled.
+        if (lens.accessPath == CameraAccessPath.NDK_DIRECT) return
+        handler.post { performTapFocus(lens, characteristics, point) }
+    }
+
+    private fun performTapFocus(
+        lens: LensCapability,
+        characteristics: CameraCharacteristics,
+        point: FocusMeteringPoint,
+    ) {
+        if (selectedLens?.stableId != lens.stableId || !started) return
+        val camera = cameraDevice ?: return
+        val session = captureSession ?: return
+        val target = repeatingSurface ?: return
+        val autofocusSupported = FocusMetering.supportsAutofocus(characteristics)
+        val lockMode = if (autofocusSupported) {
+            FocusMetering.lockAfMode(characteristics)
+        } else {
+            CaptureRequest.CONTROL_AF_MODE_OFF
+        }
+
+        fun request(trigger: Int): CaptureRequest =
+            camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                addTarget(target)
+                applyAutoControls(
+                    builder = this,
+                    lens = lens,
+                    characteristics = characteristics,
+                    focusPoint = point,
+                    afModeOverride = lockMode,
+                    afTrigger = trigger,
+                )
+            }.build()
+
+        runCatching {
+            if (autofocusSupported) {
+                session.capture(request(CaptureRequest.CONTROL_AF_TRIGGER_CANCEL), null, handler)
+                session.capture(request(CaptureRequest.CONTROL_AF_TRIGGER_START), null, handler)
+            }
+            // Keep AUTO/MACRO in IDLE after START so the lock stays on the selected subject instead
+            // of immediately returning to continuous scanning.
+            session.setRepeatingRequest(
+                request(CaptureRequest.CONTROL_AF_TRIGGER_IDLE),
+                null,
+                handler,
+            )
+        }
     }
 
     private fun restartCamera() {
@@ -296,6 +377,7 @@ class CameraPreviewController(
 
         val surface = Surface(texture)
         activeSurface = surface
+        repeatingSurface = surface
         val output = physicalOutput(surface, lens)
         val config = SessionConfiguration(
             SessionConfiguration.SESSION_REGULAR,
@@ -309,9 +391,10 @@ class CameraPreviewController(
                     }
                     captureSession = session
                     try {
+                        val characteristics = cameraCharacteristicsFor(lens)
                         val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                             addTarget(surface)
-                            applyAutoControls(this, lens)
+                            applyAutoControls(this, lens, characteristics, activeFocusPoint)
                         }.build()
                         session.setRepeatingRequest(request, null, handler)
                         pendingSurfaceProof = provenSurfaceRoute(lens)
@@ -347,6 +430,7 @@ class CameraPreviewController(
         configureTransform(lens, view.width, view.height, size)
         val reader = createYuvReader(size, lens) ?: return
         yuvReader = reader
+        repeatingSurface = reader.surface
         val output = physicalOutput(reader.surface, lens)
         val config = SessionConfiguration(
             SessionConfiguration.SESSION_REGULAR,
@@ -360,9 +444,10 @@ class CameraPreviewController(
                     }
                     captureSession = session
                     try {
+                        val characteristics = cameraCharacteristicsFor(lens)
                         val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                             addTarget(reader.surface)
-                            applyAutoControls(this, lens)
+                            applyAutoControls(this, lens, characteristics, activeFocusPoint)
                         }.build()
                         session.setRepeatingRequest(request, null, handler)
                         onStatus("${lens.displayName} • YUV preview ${size.width}×${size.height}")
@@ -395,6 +480,7 @@ class CameraPreviewController(
         if (cameraDevice === camera) cameraDevice = null
         runCatching { surface.release() }
         if (activeSurface === surface) activeSurface = null
+        if (repeatingSurface === surface) repeatingSurface = null
         pendingSurfaceProof = null
     }
 
@@ -403,6 +489,7 @@ class CameraPreviewController(
         captureSession = null
         runCatching { camera.close() }
         if (cameraDevice === camera) cameraDevice = null
+        if (repeatingSurface === reader.surface) repeatingSurface = null
         runCatching { reader.setOnImageAvailableListener(null, null) }
         runCatching { reader.close() }
         if (yuvReader === reader) yuvReader = null
@@ -547,19 +634,27 @@ class CameraPreviewController(
 
     private fun clamp8(value: Int): Int = value.coerceIn(0, 255)
 
-    private fun applyAutoControls(builder: CaptureRequest.Builder, lens: LensCapability) {
-        builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-        builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-        val afModes = runCatching {
-            manager.getCameraCharacteristics(lens.physicalCameraId ?: lens.openCameraId)
-                .get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
-                ?.toSet()
-        }.getOrNull().orEmpty()
-        when {
-            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE in afModes ->
-                builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-            CaptureRequest.CONTROL_AF_MODE_AUTO in afModes ->
-                builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+    private fun cameraCharacteristicsFor(lens: LensCapability): CameraCharacteristics =
+        runCatching { manager.getCameraCharacteristics(lens.physicalCameraId ?: lens.cameraId) }
+            .getOrElse { manager.getCameraCharacteristics(lens.openCameraId) }
+
+    private fun applyAutoControls(
+        builder: CaptureRequest.Builder,
+        lens: LensCapability,
+        characteristics: CameraCharacteristics = cameraCharacteristicsFor(lens),
+        focusPoint: FocusMeteringPoint? = null,
+        afModeOverride: Int? = null,
+        afTrigger: Int = CaptureRequest.CONTROL_AF_TRIGGER_IDLE,
+    ) {
+        val physicalId = lens.physicalCameraId
+        FocusMetering.set(builder, CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO, physicalId)
+        FocusMetering.set(builder, CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON, physicalId)
+        FocusMetering.set(builder, CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO, physicalId)
+        val afMode = afModeOverride ?: FocusMetering.previewAfMode(characteristics)
+        FocusMetering.set(builder, CaptureRequest.CONTROL_AF_MODE, afMode, physicalId)
+        FocusMetering.applyRegions(builder, characteristics, physicalId, focusPoint)
+        if (afMode != CaptureRequest.CONTROL_AF_MODE_OFF) {
+            FocusMetering.set(builder, CaptureRequest.CONTROL_AF_TRIGGER, afTrigger, physicalId)
         }
     }
 
@@ -650,6 +745,7 @@ class CameraPreviewController(
     private fun closeCamera() {
         pendingSurfaceProof = null
         lastYuvProofStableId = null
+        repeatingSurface = null
         if (nativeSessionHandle != 0L) {
             runCatching { NativeCameraSession.stop(nativeSessionHandle) }
             nativeSessionHandle = 0L
