@@ -20,6 +20,8 @@ data class NativeCameraInfo(
     val privateOutputSizes: List<NativeCameraSize>,
     val yuvOutputSizes: List<NativeCameraSize>,
     val rawOutputSizes: List<NativeCameraSize>,
+    val logicalMultiCamera: Boolean = false,
+    val physicalIds: List<String> = emptyList(),
 ) {
     val hasRawOutput: Boolean
         get() = rawOutputSizes.isNotEmpty()
@@ -33,25 +35,86 @@ data class NativeCameraOpenProbe(
         get() = status == 0
 }
 
+data class HiddenCameraProbeResult(
+    val maxNumericId: Int,
+    val attemptedCount: Int,
+    val validCameras: List<NativeCameraInfo>,
+    val hiddenIds: List<String>,
+    val rejectedStatuses: Map<String, Int>,
+) {
+    val validIds: List<String>
+        get() = validCameras.map { it.id }
+
+    val logicalTopology: Map<String, List<String>>
+        get() = validCameras
+            .filter { it.physicalIds.isNotEmpty() }
+            .associate { it.id to it.physicalIds }
+
+    companion object {
+        fun empty(maxNumericId: Int) = HiddenCameraProbeResult(
+            maxNumericId = maxNumericId,
+            attemptedCount = 0,
+            validCameras = emptyList(),
+            hiddenIds = emptyList(),
+            rejectedStatuses = emptyMap(),
+        )
+    }
+}
+
 /**
- * Native Camera2 discovery used as a second, independent view of the camera service.
+ * Native Camera2 discovery used as an independent view of the camera service.
  *
- * This intentionally mirrors MotionCam's public discovery strategy at the enumeration
- * layer: ask ACameraManager for every directly exposed ID, then inspect that exact ID's
- * metadata. Camera/Aurora still performs its own runtime session qualification before
- * exposing a lens to the normal UI.
+ * Besides normal ACameraManager_getCameraIdList enumeration, Phase 01 can perform a bounded
+ * numeric metadata scan. The scan does not blindly open every ID: it first asks
+ * ACameraManager_getCameraCharacteristics and only metadata-valid IDs proceed to runtime
+ * frame qualification in camera-core.
  */
 object NativeCameraEnumerator {
+    const val DEFAULT_HIDDEN_SCAN_MAX_ID = 255
+
     init {
         System.loadLibrary("aurora_core")
     }
 
     fun enumerate(): List<NativeCameraInfo> = runCatching {
-        val root = JSONObject(nativeEnumerateJson())
-        val cameras = root.optJSONArray("cameras") ?: JSONArray()
-        buildList(cameras.length()) {
-            for (index in 0 until cameras.length()) {
-                val item = cameras.getJSONObject(index)
+        parseCameraArray(JSONObject(nativeEnumerateJson()).optJSONArray("cameras"))
+    }.getOrDefault(emptyList())
+
+    fun searchHiddenNumericIds(
+        maxNumericId: Int = DEFAULT_HIDDEN_SCAN_MAX_ID,
+    ): HiddenCameraProbeResult = runCatching {
+        val boundedMax = maxNumericId.coerceIn(0, 1024)
+        val root = JSONObject(nativeSearchHiddenNumericJson(boundedMax))
+        val rejectedObject = root.optJSONObject("rejectedStatuses") ?: JSONObject()
+        val rejected = buildMap {
+            val keys = rejectedObject.keys()
+            while (keys.hasNext()) {
+                val id = keys.next()
+                put(id, rejectedObject.optInt(id, Int.MIN_VALUE))
+            }
+        }
+        HiddenCameraProbeResult(
+            maxNumericId = root.optInt("maxId", boundedMax),
+            attemptedCount = root.optInt("attemptedCount", 0),
+            validCameras = parseCameraArray(root.optJSONArray("validCameras")),
+            hiddenIds = root.optStringArray("hiddenIds"),
+            rejectedStatuses = rejected,
+        )
+    }.getOrElse { HiddenCameraProbeResult.empty(maxNumericId.coerceIn(0, 1024)) }
+
+    /** Diagnostic-only exact-ID open probe. Real NDK sessions use [NativeCameraSession]. */
+    fun probeDirectOpen(cameraId: String): NativeCameraOpenProbe =
+        NativeCameraOpenProbe(cameraId, nativeProbeDirectOpen(cameraId))
+
+    private external fun nativeEnumerateJson(): String
+    private external fun nativeSearchHiddenNumericJson(maxNumericId: Int): String
+    private external fun nativeProbeDirectOpen(cameraId: String): Int
+
+    private fun parseCameraArray(values: JSONArray?): List<NativeCameraInfo> {
+        values ?: return emptyList()
+        return buildList(values.length()) {
+            for (index in 0 until values.length()) {
+                val item = values.getJSONObject(index)
                 add(
                     NativeCameraInfo(
                         id = item.getString("id"),
@@ -65,18 +128,13 @@ object NativeCameraEnumerator {
                         privateOutputSizes = item.optSizeArray("privateOutputSizes"),
                         yuvOutputSizes = item.optSizeArray("yuvOutputSizes"),
                         rawOutputSizes = item.optSizeArray("rawOutputSizes"),
+                        logicalMultiCamera = item.optBoolean("logicalMultiCamera", false),
+                        physicalIds = item.optStringArray("physicalIds"),
                     )
                 )
             }
         }
-    }.getOrDefault(emptyList())
-
-    /** Diagnostic-only exact-ID open probe. Real NDK sessions use [NativeCameraSession]. */
-    fun probeDirectOpen(cameraId: String): NativeCameraOpenProbe =
-        NativeCameraOpenProbe(cameraId, nativeProbeDirectOpen(cameraId))
-
-    private external fun nativeEnumerateJson(): String
-    private external fun nativeProbeDirectOpen(cameraId: String): Int
+    }
 
     private fun JSONObject.optNullableInt(name: String): Int? =
         if (has(name) && !isNull(name)) getInt(name) else null
@@ -90,6 +148,16 @@ object NativeCameraEnumerator {
             for (index in 0 until values.length()) {
                 val item = values.getJSONObject(index)
                 add(NativeCameraSize(item.getInt("width"), item.getInt("height")))
+            }
+        }
+    }
+
+    private fun JSONObject.optStringArray(name: String): List<String> {
+        val values = optJSONArray(name) ?: return emptyList()
+        return buildList(values.length()) {
+            for (index in 0 until values.length()) {
+                val value = values.optString(index, "")
+                if (value.isNotEmpty()) add(value)
             }
         }
     }
