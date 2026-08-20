@@ -12,15 +12,15 @@ import kotlin.math.max
  * 61 is the profile "61/20"). Those profiles belong to the same family because their cameraId is
  * the same target sensor.
  *
- * A logical parent ID is NOT automatically the same family as one of its physical children. Direct
- * logical output can represent a different/composite/default view. Cross-ID family merging is only
- * allowed for a very strong public-Java <-> alternate-NDK mirror signature. Hidden auxiliaries are
- * never merged with each other from optics alone.
+ * Not every valid camera-service endpoint is a user-facing lens. OEM logical aggregators/helper
+ * endpoints remain available internally for routing/fallback, but the normal selector only exposes
+ * physical/user-meaningful family defaults.
  */
 data class LensFamily(
     val familyId: String,
     val defaultRoute: LensCapability,
     val aliases: List<LensCapability>,
+    val selectorVisible: Boolean = true,
 ) {
     val routes: List<LensCapability>
         get() = listOf(defaultRoute) + aliases
@@ -53,9 +53,9 @@ object LensFamilyResolver {
         // exactly matching MotionCam's "parent/physical" profile model.
 
         // OEMs can also publish a normal Java endpoint and expose an alternate NDK endpoint that is
-        // effectively a mirror of the same sensor. Merge those different IDs only with a very strong
-        // hardware + stream signature. NDK<->NDK is intentionally excluded because two genuine aux
-        // modules can use identical sensor models and optics.
+        // effectively a mirror of the same sensor. Merge those different IDs only with a strong
+        // hardware + stream fingerprint. NDK<->NDK is intentionally excluded because two genuine
+        // auxiliary modules can use identical sensor models and optics.
         val publicJava = usable.filter(::isNormalPublicJava)
         val alternateNdk = usable.filter(::isAlternateNdkDirect)
         alternateNdk.forEach { alternate ->
@@ -68,7 +68,7 @@ object LensFamilyResolver {
 
         val groups = usable.groupBy { find(it.cameraId) }
         return groups.values
-            .map(::buildFamily)
+            .map { familyRoutes -> buildFamily(familyRoutes, usable) }
             .sortedWith(
                 compareBy<LensFamily> { cameraSortKey(it.defaultRoute) }
                     .thenBy { it.familyId }
@@ -76,9 +76,11 @@ object LensFamilyResolver {
     }
 
     fun defaultsForSelector(routes: List<LensCapability>): List<LensCapability> =
-        resolve(routes).map { family ->
-            family.defaultRoute.copy(displayName = "ID ${family.defaultRoute.cameraId}")
-        }
+        resolve(routes)
+            .filter { it.selectorVisible }
+            .map { family ->
+                family.defaultRoute.copy(displayName = "ID ${family.defaultRoute.cameraId}")
+            }
 
     /** Conservative optical comparison. Missing physical geometry means unknown, never equal. */
     fun opticalEquivalent(left: LensCapability, right: LensCapability): Boolean {
@@ -103,7 +105,10 @@ object LensFamilyResolver {
         return sensorGeometryCompatible(left, right, MAX_SENSOR_RELATIVE_DELTA)
     }
 
-    private fun buildFamily(routes: List<LensCapability>): LensFamily {
+    private fun buildFamily(
+        routes: List<LensCapability>,
+        allUsableRoutes: List<LensCapability>,
+    ): LensFamily {
         val canonicalId = canonicalCameraId(routes)
         val canonicalRoutes = routes.filter { it.cameraId == canonicalId }.ifEmpty { routes }
         val default = canonicalRoutes.minByOrNull(::routeScore) ?: routes.first()
@@ -114,7 +119,35 @@ object LensFamilyResolver {
             familyId = canonicalId,
             defaultRoute = default,
             aliases = aliases,
+            selectorVisible = !isInternalControlFamily(routes, allUsableRoutes),
         )
+    }
+
+    /**
+     * A non-public NDK logical multi-camera endpoint is a control/aggregation route rather than a
+     * physical lens button when at least one of its declared physical children is independently
+     * addressable. Keep it cached for topology and future PHYSICAL_VIA_LOGICAL routing, but don't
+     * expose it beside the real child lenses.
+     *
+     * Public Java logical cameras are intentionally not hidden here: on many phones the public
+     * logical camera is the normal main camera and may be the only universally usable default.
+     */
+    private fun isInternalControlFamily(
+        familyRoutes: List<LensCapability>,
+        allUsableRoutes: List<LensCapability>,
+    ): Boolean {
+        val familyIds = familyRoutes.mapTo(setOf()) { it.cameraId }
+        val visibleTargetIds = allUsableRoutes.mapTo(setOf()) { it.cameraId }
+
+        return familyRoutes.any { route ->
+            route.cameraId in familyIds &&
+                route.physicalCameraId == null &&
+                route.accessPath == CameraAccessPath.NDK_DIRECT &&
+                CameraDiscoverySource.JAVA_DIRECT !in route.discoverySources &&
+                route.isLogicalMultiCamera &&
+                route.logicalPhysicalIds.isNotEmpty() &&
+                route.logicalPhysicalIds.any { childId -> childId in visibleTargetIds }
+        }
     }
 
     private fun canonicalCameraId(routes: List<LensCapability>): String {
@@ -161,28 +194,26 @@ object LensFamilyResolver {
             return false
         }
 
-        return streamSignatureMatches(left, right)
+        return streamEvidenceScore(left, right) >= MIN_MIRROR_STREAM_EVIDENCE
     }
 
-    private fun streamSignatureMatches(left: LensCapability, right: LensCapability): Boolean {
-        var comparable = 0
-        var matches = 0
+    /**
+     * Java and NDK wrappers can advertise different complete stream tables for the same sensor, so
+     * requiring two identical largest outputs was too strict. Instead use overlap evidence:
+     * RAW overlap is strongest, YUV overlap is strong, PRIVATE preview overlap is supporting only.
+     */
+    private fun streamEvidenceScore(left: LensCapability, right: LensCapability): Int {
+        var score = 0
+        if (hasSizeOverlap(left.rawSizes, right.rawSizes)) score += 4
+        if (hasSizeOverlap(left.yuvSizes, right.yuvSizes)) score += 2
+        if (hasSizeOverlap(left.previewSizes, right.previewSizes)) score += 1
+        return score
+    }
 
-        fun compareLargest(leftSizes: List<Size>, rightSizes: List<Size>) {
-            val leftLargest = leftSizes.maxByOrNull(::area) ?: return
-            val rightLargest = rightSizes.maxByOrNull(::area) ?: return
-            comparable += 1
-            if (sameSize(leftLargest, rightLargest)) matches += 1
-        }
-
-        compareLargest(left.previewSizes, right.previewSizes)
-        compareLargest(left.yuvSizes, right.yuvSizes)
-        compareLargest(left.rawSizes, right.rawSizes)
-
-        // Two matching stream classes are enough to call this the same sensor profile. This allows
-        // PRIVATE preview constraints to differ between Java/NDK wrappers while YUV/RAW still prove
-        // the underlying hardware identity.
-        return comparable >= 2 && matches >= 2
+    private fun hasSizeOverlap(left: List<Size>, right: List<Size>): Boolean {
+        if (left.isEmpty() || right.isEmpty()) return false
+        val rightKeys = right.asSequence().map { sizeKey(it) }.toHashSet()
+        return left.any { sizeKey(it) in rightKeys }
     }
 
     private fun sensorGeometryCompatible(
@@ -216,10 +247,8 @@ object LensFamilyResolver {
     private fun relativeDelta(left: Float, right: Float): Float =
         abs(left - right) / max(left, right)
 
-    private fun sameSize(left: Size, right: Size): Boolean =
-        left.width == right.width && left.height == right.height
-
-    private fun area(size: Size): Long = size.width.toLong() * size.height.toLong()
+    private fun sizeKey(size: Size): Long =
+        (size.width.toLong() shl 32) xor (size.height.toLong() and 0xffffffffL)
 
     private fun cameraSortKey(lens: LensCapability): Int =
         lens.cameraId.toIntOrNull() ?: Int.MAX_VALUE
@@ -229,7 +258,8 @@ object LensFamilyResolver {
     private const val MAX_FOCAL_RELATIVE_DELTA = 0.025f
     private const val MAX_SENSOR_RELATIVE_DELTA = 0.04f
 
-    private const val MIRROR_FOV_DELTA_DEGREES = 1.0f
-    private const val MIRROR_FOCAL_RELATIVE_DELTA = 0.01f
-    private const val MIRROR_SENSOR_RELATIVE_DELTA = 0.015f
+    private const val MIRROR_FOV_DELTA_DEGREES = 1.25f
+    private const val MIRROR_FOCAL_RELATIVE_DELTA = 0.0125f
+    private const val MIRROR_SENSOR_RELATIVE_DELTA = 0.02f
+    private const val MIN_MIRROR_STREAM_EVIDENCE = 2
 }
