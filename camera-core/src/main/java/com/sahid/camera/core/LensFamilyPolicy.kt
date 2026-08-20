@@ -1,7 +1,7 @@
 package com.sahid.camera.core
 
 /**
- * Stable, device-independent policy knobs for Phase-01 lens-family discovery.
+ * Stable, device-independent policy knobs for lens-family discovery.
  *
  * CLASSIFIER_VERSION is deliberately separate from the app version and the ROM fingerprint. Bump
  * it only when family/role semantics change in a way that requires rebuilding metadata candidates.
@@ -9,7 +9,7 @@ package com.sahid.camera.core
  * invalidated and rebuilt.
  */
 object LensFamilyPolicy {
-    const val CLASSIFIER_VERSION = 1
+    const val CLASSIFIER_VERSION = 2
 
     /** Fast default that covers the numeric ranges used by the overwhelming majority of HALs. */
     const val BASE_NUMERIC_SCAN_MAX_ID = 255
