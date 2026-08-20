@@ -1,7 +1,5 @@
 package com.sahid.camera.core
 
-import android.hardware.camera2.CameraCharacteristics
-import android.util.Size
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -123,7 +121,7 @@ class LensValueFilterTest {
             if (learned) add(CameraDiscoverySource.LEARNED_CACHE)
             else add(CameraDiscoverySource.AUTO_METADATA)
         },
-        facing = CameraCharacteristics.LENS_FACING_BACK,
+        facing = null,
         displayName = "ID $id",
         focalLengthMm = focal,
         sensorWidthMm = sensorWidth,
@@ -131,7 +129,7 @@ class LensValueFilterTest {
         horizontalFovDegrees = fov,
         rawSupported = false,
         rawSizes = emptyList(),
-        previewSizes = listOf(Size(1560, 720)),
+        previewSizes = emptyList(),
         yuvSizes = emptyList(),
         manualSensor = false,
         burstCapture = false,
