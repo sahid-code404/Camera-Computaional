@@ -27,12 +27,9 @@ jobs:
         shell: bash
         run: |
           yes | sdkmanager --licenses >/dev/null || true
-          # API 37 / Android 17 is still distributed through the preview channel.
-          # Keep the universal app on compileSdk 37 while explicitly allowing preview
-          # SDK packages in CI; this does not opt runtime behavior into hidden APIs.
-          sdkmanager --channel=3 \
+          sdkmanager \
             "platform-tools" \
-            "platforms;android-37" \
+            "platforms;android-36" \
             "build-tools;36.0.0" \
             "ndk;28.2.13676358" \
             "cmake;3.22.1"
