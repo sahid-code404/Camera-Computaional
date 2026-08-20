@@ -31,6 +31,7 @@ object AuroraDngWriter {
         image: Image,
         characteristics: CameraCharacteristics,
         captureResult: CaptureResult,
+        displayRotation: Int,
     ): RawCaptureRecord {
         require(image.format == ImageFormat.RAW_SENSOR) { "DNG requires RAW_SENSOR" }
         val resultTimestamp = captureResult.get(CaptureResult.SENSOR_TIMESTAMP)
@@ -41,7 +42,13 @@ object AuroraDngWriter {
 
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
         val fileName = "IMG_${stamp}_AURORA.dng"
-        val orientation = dngOrientation(characteristics)
+        val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+        val uprightDegrees = CameraOrientation.sensorToDeviceDegrees(
+            sensorOrientation = sensorOrientation,
+            isFrontFacing = lens.isFrontFacing,
+            displayRotation = displayRotation,
+        )
+        val orientation = CameraOrientation.exifOrientationForDegrees(uprightDegrees)
         val relativePath = CameraStoragePolicy.DNG_RELATIVE_PATH
 
         val displayFile = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -126,18 +133,5 @@ object AuroraDngWriter {
             }
         }
         return destination
-    }
-
-    /**
-     * The app is portrait-locked. Keep the Bayer mosaic untouched and express display rotation in
-     * the DNG/TIFF orientation tag.
-     */
-    private fun dngOrientation(characteristics: CameraCharacteristics): Int {
-        return when ((characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0) % 360) {
-            90 -> 6
-            180 -> 3
-            270 -> 8
-            else -> 1
-        }
     }
 }
