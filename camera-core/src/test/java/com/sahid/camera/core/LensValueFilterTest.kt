@@ -143,6 +143,7 @@ class LensValueFilterTest {
             rawSessionQualified = false,
             qualifiedRawSize = null,
             detail = "test",
+            checkedAtElapsedRealtimeMs = 0L,
         ),
     )
 }
