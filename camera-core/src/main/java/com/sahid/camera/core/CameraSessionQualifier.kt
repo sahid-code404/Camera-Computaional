@@ -29,9 +29,9 @@ import java.util.concurrent.atomic.AtomicReference
  * Phase-01 runtime session qualifier.
  *
  * NDK_DIRECT never falls back to Java CameraManager: the complete route stays
- * ACameraManager -> ACameraDevice -> ACameraCaptureSession -> ACaptureRequest and is only
- * accepted after an actual SurfaceTexture/YUV/RAW frame arrives. Java/physical paths keep
- * Camera2 session qualification and physical routing through setPhysicalCameraId().
+ * ACameraManager -> ACameraDevice -> ACameraCaptureSession -> ACaptureRequest. Phase-01 lens
+ * discovery uses [qualifyPreviewOnly] so RAW probing cannot block startup or hidden-lens search;
+ * the full [qualify] path is retained for explicit RAW diagnostics and Phase 02 work.
  */
 class CameraSessionQualifier(context: Context) : Closeable {
     private val appContext = context.applicationContext
@@ -41,7 +41,7 @@ class CameraSessionQualifier(context: Context) : Closeable {
     private val executor = Executor { runnable -> handler.post(runnable) }
 
     fun qualify(lens: LensCapability): LensCapability {
-        if (ContextCompat.checkSelfPermission(appContext, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+        if (!hasCameraPermission()) {
             return lens.copy(
                 qualification = LensQualification.unqualified("Camera permission missing during qualification"),
             )
@@ -50,6 +50,144 @@ class CameraSessionQualifier(context: Context) : Closeable {
             qualifyNativeDirect(lens)
         } else {
             qualifyJavaPath(lens)
+        }
+    }
+
+    /**
+     * Fast Phase-01 gate. Test only the renderer needed to make the lens usable in the UI.
+     * RAW endpoint probing is deliberately deferred so discovering a camera never burns several
+     * RAW session timeouts before the user can see the preview.
+     */
+    fun qualifyPreviewOnly(lens: LensCapability): LensCapability {
+        if (!hasCameraPermission()) {
+            return lens.copy(
+                qualification = LensQualification.unqualified("Camera permission missing during qualification"),
+            )
+        }
+        return if (lens.accessPath == CameraAccessPath.NDK_DIRECT) {
+            qualifyNativePreviewOnly(lens)
+        } else {
+            qualifyJavaPreviewOnly(lens)
+        }
+    }
+
+    private fun hasCameraPermission(): Boolean =
+        ContextCompat.checkSelfPermission(appContext, Manifest.permission.CAMERA) ==
+            PackageManager.PERMISSION_GRANTED
+
+    private fun qualifyNativePreviewOnly(lens: LensCapability): LensCapability {
+        val previewSize = chooseQualificationSize(lens.previewSizes)
+        val yuvSize = chooseQualificationSize(lens.yuvSizes)
+
+        val previewCheck = previewSize?.let {
+            checkNativePreviewFrame(lens.cameraId, it, FAST_FRAME_TIMEOUT_MS)
+        }
+        val previewQualified = previewCheck?.supported == true
+        val yuvCheck = if (!previewQualified && yuvSize != null) {
+            checkNativeImageFrame(
+                cameraId = lens.cameraId,
+                size = yuvSize,
+                format = ImageFormat.YUV_420_888,
+                repeating = true,
+                timeoutMs = FAST_FRAME_TIMEOUT_MS,
+            )
+        } else {
+            null
+        }
+        val yuvQualified = yuvCheck?.supported == true
+        val cameraOpened = listOfNotNull(previewCheck, yuvCheck).any { it.cameraOpened }
+
+        val detail = buildString {
+            append("FAST NDK_DIRECT ")
+            append(lens.cameraId)
+            append(": ")
+            when {
+                previewQualified -> append("PRIVATE frame OK ${previewSize!!.width}×${previewSize.height}")
+                previewCheck != null -> append("PRIVATE failed (${previewCheck.detail})")
+                else -> append("no PRIVATE size")
+            }
+            when {
+                yuvQualified -> append("; YUV frame OK ${yuvSize!!.width}×${yuvSize.height}")
+                yuvCheck != null -> append("; YUV failed (${yuvCheck.detail})")
+                !previewQualified -> append("; no YUV fallback")
+            }
+            append("; RAW deferred")
+        }
+
+        return lens.copy(
+            qualification = LensQualification(
+                accessPathOpenQualified = cameraOpened,
+                previewSessionQualified = previewQualified,
+                yuvSessionQualified = yuvQualified,
+                rawSessionQualified = false,
+                qualifiedRawSize = null,
+                detail = detail,
+            ),
+        )
+    }
+
+    private fun qualifyJavaPreviewOnly(lens: LensCapability): LensCapability {
+        val open = openCamera(lens.openCameraId, FAST_OPEN_TIMEOUT_MS)
+        val camera = open.camera
+            ?: return lens.copy(
+                qualification = LensQualification.unqualified("FAST ${open.detail}"),
+            )
+
+        return try {
+            val previewSize = chooseQualificationSize(lens.previewSizes)
+            val yuvSize = chooseQualificationSize(lens.yuvSizes)
+            val previewCheck = previewSize?.let {
+                checkSession(
+                    camera = camera,
+                    lens = lens,
+                    previewSize = it,
+                    timeoutMs = FAST_SESSION_TIMEOUT_MS,
+                )
+            }
+            val previewQualified = previewCheck?.supported == true
+            val yuvCheck = if (!previewQualified && yuvSize != null) {
+                checkSession(
+                    camera = camera,
+                    lens = lens,
+                    yuvSize = yuvSize,
+                    timeoutMs = FAST_SESSION_TIMEOUT_MS,
+                )
+            } else {
+                null
+            }
+            val yuvQualified = yuvCheck?.supported == true
+
+            val detail = buildString {
+                append("FAST ")
+                append(lens.accessPath.name)
+                append(" open ")
+                append(lens.openCameraId)
+                append(" OK")
+                when {
+                    previewQualified -> append("; preview OK ${previewSize!!.width}×${previewSize.height}")
+                    previewCheck != null -> append("; preview rejected (${previewCheck.detail})")
+                    else -> append("; no preview size")
+                }
+                when {
+                    yuvQualified -> append("; YUV OK ${yuvSize!!.width}×${yuvSize.height}")
+                    yuvCheck != null -> append("; YUV rejected (${yuvCheck.detail})")
+                    !previewQualified -> append("; no YUV fallback")
+                }
+                append("; RAW deferred")
+            }
+
+            lens.copy(
+                qualification = LensQualification(
+                    accessPathOpenQualified = true,
+                    previewSessionQualified = previewQualified,
+                    yuvSessionQualified = yuvQualified,
+                    rawSessionQualified = false,
+                    qualifiedRawSize = null,
+                    detail = detail,
+                ),
+            )
+        } finally {
+            runCatching { camera.close() }
         }
     }
 
@@ -130,7 +268,11 @@ class CameraSessionQualifier(context: Context) : Closeable {
         )
     }
 
-    private fun checkNativePreviewFrame(cameraId: String, size: Size): NativeFrameCheck {
+    private fun checkNativePreviewFrame(
+        cameraId: String,
+        size: Size,
+        timeoutMs: Long = FRAME_TIMEOUT_MS,
+    ): NativeFrameCheck {
         val frameArrived = CountDownLatch(1)
         val texture = runCatching {
             SurfaceTexture(false).apply {
@@ -152,7 +294,7 @@ class CameraSessionQualifier(context: Context) : Closeable {
             )
         }
 
-        val frameSeen = frameArrived.await(FRAME_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        val frameSeen = frameArrived.await(timeoutMs, TimeUnit.MILLISECONDS)
         NativeCameraSession.stop(start.handle)
         runCatching { texture.setOnFrameAvailableListener(null) }
         surface.release()
@@ -169,6 +311,7 @@ class CameraSessionQualifier(context: Context) : Closeable {
         size: Size,
         format: Int,
         repeating: Boolean,
+        timeoutMs: Long = FRAME_TIMEOUT_MS,
     ): NativeFrameCheck {
         val reader = runCatching {
             ImageReader.newInstance(size.width, size.height, format, 3)
@@ -200,7 +343,7 @@ class CameraSessionQualifier(context: Context) : Closeable {
             )
         }
 
-        val frameSeen = frameArrived.await(FRAME_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        val frameSeen = frameArrived.await(timeoutMs, TimeUnit.MILLISECONDS)
         NativeCameraSession.stop(start.handle)
         reader.setOnImageAvailableListener(null, null)
         reader.close()
@@ -340,7 +483,10 @@ class CameraSessionQualifier(context: Context) : Closeable {
         return (sorted.take(MAX_RAW_PROBES - 1) + sorted.last()).distinct()
     }
 
-    private fun openCamera(cameraId: String): OpenResult {
+    private fun openCamera(
+        cameraId: String,
+        timeoutMs: Long = OPEN_TIMEOUT_MS,
+    ): OpenResult {
         val latch = CountDownLatch(1)
         val cameraRef = AtomicReference<CameraDevice?>()
         val detailRef = AtomicReference("Camera open timed out")
@@ -369,9 +515,9 @@ class CameraSessionQualifier(context: Context) : Closeable {
             return OpenResult(null, "Camera open failed: ${t.javaClass.simpleName}")
         }
 
-        if (!latch.await(OPEN_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+        if (!latch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
             runCatching { cameraRef.getAndSet(null)?.close() }
-            return OpenResult(null, "Camera open timed out")
+            return OpenResult(null, "Camera open timed out ${timeoutMs}ms")
         }
 
         return OpenResult(cameraRef.get(), detailRef.get())
@@ -383,6 +529,7 @@ class CameraSessionQualifier(context: Context) : Closeable {
         previewSize: Size? = null,
         yuvSize: Size? = null,
         rawSize: Size? = null,
+        timeoutMs: Long = SESSION_TIMEOUT_MS,
     ): SessionCheck {
         if (previewSize == null && yuvSize == null && rawSize == null) {
             return SessionCheck(false, "No output supplied")
@@ -463,8 +610,8 @@ class CameraSessionQualifier(context: Context) : Closeable {
             latch.countDown()
         }
 
-        if (!latch.await(SESSION_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
-            resultRef.set(SessionCheck(false, "Session configuration timed out"))
+        if (!latch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+            resultRef.set(SessionCheck(false, "Session configuration timed out ${timeoutMs}ms"))
         }
 
         runCatching { sessionRef.getAndSet(null)?.close() }
@@ -554,6 +701,9 @@ class CameraSessionQualifier(context: Context) : Closeable {
         const val OPEN_TIMEOUT_MS = 4_000L
         const val SESSION_TIMEOUT_MS = 4_000L
         const val FRAME_TIMEOUT_MS = 5_000L
+        const val FAST_OPEN_TIMEOUT_MS = 1_500L
+        const val FAST_SESSION_TIMEOUT_MS = 1_500L
+        const val FAST_FRAME_TIMEOUT_MS = 1_800L
         const val MAX_RAW_PROBES = 6
     }
 }
