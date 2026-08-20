@@ -55,7 +55,9 @@ import com.sahid.camera.core.CameraDiagnostics
 import com.sahid.camera.core.CameraDiscoverySource
 import com.sahid.camera.core.CameraPreviewController
 import com.sahid.camera.core.InstantLensBootstrap
+import com.sahid.camera.core.LearnedLensStore
 import com.sahid.camera.core.LensCapability
+import com.sahid.camera.core.LensValueFilter
 import com.sahid.camera.core.ProgressiveLensDiscovery
 import com.sahid.camera.ui.CameraTheme
 import com.sahid.camera.update.OtaCheckResult
@@ -130,14 +132,16 @@ private fun PermissionScreen(onGrant: () -> Unit) {
 private fun CameraScreen() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val learnedStore = remember { LearnedLensStore(context) }
 
     // The hot path is intentionally tiny. A learned ROM reads only SharedPreferences; a fresh ROM
-    // performs only standard Java advertised metadata so the first preview can start immediately.
+    // performs only enough standard Java advertised metadata work to start the primary preview.
     val bootstrap = remember { InstantLensBootstrap.load(context) }
     var lenses by remember { mutableStateOf(bootstrap.lenses) }
     var selectedLens by remember {
         mutableStateOf(
-            bootstrap.lenses.firstOrNull { !it.isFrontFacing }
+            bootstrap.lenses.firstOrNull { it.learnedFromCache && !it.isFrontFacing }
+                ?: bootstrap.lenses.firstOrNull { !it.isFrontFacing }
                 ?: bootstrap.lenses.firstOrNull()
         )
     }
@@ -146,7 +150,7 @@ private fun CameraScreen() {
         mutableStateOf(
             when {
                 bootstrap.learned && bootstrap.lenses.isNotEmpty() ->
-                    "Instant lens map • ${bootstrap.lenses.size} cached"
+                    "Instant lens map • ${bootstrap.lenses.size} useful cameras cached"
                 bootstrap.lenses.isNotEmpty() ->
                     "Opening camera • discovering extra lenses automatically"
                 else -> "Discovering cameras automatically…"
@@ -164,10 +168,9 @@ private fun CameraScreen() {
         }.getOrElse { "Aurora native core unavailable" }
     }
 
-    // Progressive first-launch discovery: wait just long enough for the selected public/cached lens
-    // to begin opening, then scan metadata only on a worker thread. This pass never openCamera()s,
-    // never configures sessions, and therefore cannot block the primary preview. Hidden metadata-
-    // addressable lenses simply appear in the selector as soon as the cheap scan completes.
+    // Progressive first-launch discovery runs only after preview startup. The discovery layer now
+    // filters helper/logical aliases by strong optical identity and persists useful metadata
+    // candidates separately from frame-proven routes.
     LaunchedEffect(Unit) {
         delay(150)
         autoDiscoveryBusy = true
@@ -179,29 +182,37 @@ private fun CameraScreen() {
         if (discovered.isNotEmpty()) {
             val previousSelectedId = selectedLens?.cameraId
             val beforeIds = lenses.map { it.cameraId }.toSet()
-            val mergedById = linkedMapOf<String, LensCapability>()
-
-            // Preserve a real learned/live route over an optimistic metadata candidate.
-            lenses.forEach { lens -> mergedById[lens.cameraId] = lens }
-            discovered.forEach { candidate ->
-                val current = mergedById[candidate.cameraId]
-                if (current == null || !current.learnedFromCache) {
-                    mergedById[candidate.cameraId] = candidate
-                }
-            }
-
-            lenses = mergedById.values.sortedWith(
-                compareBy<LensCapability> { it.cameraId.toIntOrNull() ?: Int.MAX_VALUE }
-                    .thenBy { it.cameraId }
-            )
+            lenses = LensValueFilter.filterForSelector(lenses + discovered)
             selectedLens = previousSelectedId?.let { id ->
                 lenses.firstOrNull { it.cameraId == id }
-            } ?: lenses.firstOrNull { !it.isFrontFacing }
+            } ?: lenses.firstOrNull { it.learnedFromCache && !it.isFrontFacing }
+                ?: lenses.firstOrNull { !it.isFrontFacing }
                 ?: lenses.firstOrNull()
 
             val newCount = lenses.count { it.cameraId !in beforeIds }
             if (newCount > 0 && status.startsWith("Discovering cameras")) {
-                status = "Ready • $newCount extra lens${if (newCount == 1) "" else "es"} found automatically"
+                status = "Ready • $newCount useful lens${if (newCount == 1) "" else "es"} found automatically"
+            }
+        }
+    }
+
+    // The live controller writes LEARNED_CACHE only after an actual TextureView/ImageReader frame.
+    // Poll the tiny SharedPreferences map briefly after a selection so the chip promotes from
+    // Ready/Auto to Learned immediately instead of waiting for an app restart.
+    LaunchedEffect(selectedLens?.stableId) {
+        val selectedId = selectedLens?.cameraId ?: return@LaunchedEffect
+        repeat(20) {
+            delay(100)
+            val provenRoutes = withContext(Dispatchers.Default) {
+                learnedStore.load().routes
+            }
+            val proven = provenRoutes.firstOrNull { it.cameraId == selectedId }
+            if (proven != null) {
+                lenses = LensValueFilter.filterForSelector(lenses + provenRoutes)
+                selectedLens = lenses.firstOrNull {
+                    it.cameraId == selectedId && it.learnedFromCache
+                } ?: lenses.firstOrNull { it.cameraId == selectedId }
+                return@LaunchedEffect
             }
         }
     }
@@ -264,8 +275,8 @@ private fun CameraScreen() {
                     }
                 }
 
-                // This is now an advanced fallback only. Normal first-launch lens discovery is
-                // automatic. Deep rescan retains direct-open probing for OEMs that hide metadata.
+                // Advanced fallback only. Normal discovery is automatic; deep rescan retains
+                // direct-open probing for OEMs that hide the camera even from metadata lookup.
                 Button(
                     enabled = !lensScanBusy,
                     onClick = {
@@ -277,13 +288,14 @@ private fun CameraScreen() {
                             val report = withContext(Dispatchers.Default) {
                                 CameraCapabilityProbe(context).probeDeepQualificationReport()
                             }
-                            lenses = report.visibleLenses
+                            lenses = LensValueFilter.filterForSelector(report.visibleLenses)
                             selectedLens = previousId?.let { id ->
-                                report.visibleLenses.firstOrNull { it.cameraId == id }
-                            } ?: report.visibleLenses.firstOrNull { !it.isFrontFacing }
-                                ?: report.visibleLenses.firstOrNull()
+                                lenses.firstOrNull { it.cameraId == id }
+                            } ?: lenses.firstOrNull { it.learnedFromCache && !it.isFrontFacing }
+                                ?: lenses.firstOrNull { !it.isFrontFacing }
+                                ?: lenses.firstOrNull()
                             diagnosticsJson = CameraDiagnostics.toJson(report)
-                            status = "Lens map learned • ${report.visibleLenses.size} working cameras cached"
+                            status = "Lens map learned • ${lenses.size} useful cameras"
                             lensScanBusy = false
                         }
                     },
@@ -351,9 +363,9 @@ private fun CameraScreen() {
             Spacer(Modifier.height(6.dp))
             Text(
                 if (autoDiscoveryBusy) {
-                    "Preview first • finding extra lenses in background…"
+                    "Preview first • finding useful extra lenses in background…"
                 } else {
-                    "Instant preview • automatic background lens discovery • Deep rescan only for OEM edge cases"
+                    "Instant preview • useful lens cache • helper aliases hidden automatically"
                 },
                 color = Color.Gray,
                 fontSize = 10.sp,
@@ -377,10 +389,12 @@ private fun LensSelector(
             val qualifiedRaw = lens.qualification.qualifiedRawSize
             val hidden = CameraDiscoverySource.HIDDEN_ID_PROBE in lens.discoverySources
             val learned = CameraDiscoverySource.LEARNED_CACHE in lens.discoverySources
+            val ready = CameraDiscoverySource.CANDIDATE_CACHE in lens.discoverySources
             val automatic = CameraDiscoverySource.AUTO_METADATA in lens.discoverySources
             val previewLabel = buildString {
                 when {
                     learned -> append("Learned • ")
+                    ready -> append("Ready • ")
                     automatic && hidden -> append("Auto hidden • ")
                     automatic -> append("Auto • ")
                     hidden -> append("Hidden • ")
