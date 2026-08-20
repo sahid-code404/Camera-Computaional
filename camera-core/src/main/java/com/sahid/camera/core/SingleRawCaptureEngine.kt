@@ -70,6 +70,7 @@ class SingleRawCaptureEngine(context: Context) {
         val reader = ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, 3)
 
         val acceptFinalImage = AtomicBoolean(false)
+        val warmDrainLatchRef = AtomicReference<CountDownLatch?>()
         val imageRef = AtomicReference<Image?>()
         val resultRef = AtomicReference<CaptureResult?>()
         val errorRef = AtomicReference<Throwable?>()
@@ -79,6 +80,7 @@ class SingleRawCaptureEngine(context: Context) {
             val image = runCatching { source.acquireNextImage() }.getOrNull() ?: return@setOnImageAvailableListener
             if (!acceptFinalImage.get()) {
                 image.close()
+                warmDrainLatchRef.getAndSet(null)?.countDown()
                 return@setOnImageAvailableListener
             }
             if (imageRef.compareAndSet(null, image)) {
@@ -149,9 +151,6 @@ class SingleRawCaptureEngine(context: Context) {
             sessionError.get()?.let { error(it) }
             val session = sessionRef.get() ?: error("DNG session unavailable")
 
-            // New CameraDevice/session state is not guaranteed to inherit the focus/exposure state
-            // from the preview session that was just closed. Drive a few disposable RAW requests so
-            // AF/AE/AWB can settle before the one frame that becomes the DNG.
             warmThreeA(
                 camera = camera,
                 session = session,
@@ -159,7 +158,11 @@ class SingleRawCaptureEngine(context: Context) {
                 lens = lens,
                 characteristics = characteristics,
                 handler = handler,
+                warmDrainLatchRef = warmDrainLatchRef,
             )
+
+            // No discarded warm-up image is allowed to remain queued when the final gate opens.
+            warmDrainLatchRef.getAndSet(null)?.await(THREE_A_DRAIN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
 
             val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
             val captureOrientationDegrees = CameraOrientation.sensorToDeviceDegrees(
@@ -239,6 +242,7 @@ class SingleRawCaptureEngine(context: Context) {
         lens: LensCapability,
         characteristics: CameraCharacteristics,
         handler: Handler,
+        warmDrainLatchRef: AtomicReference<CountDownLatch?>,
     ) {
         val afModes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
             ?.toSet().orEmpty()
@@ -246,7 +250,10 @@ class SingleRawCaptureEngine(context: Context) {
 
         for (attempt in 0 until THREE_A_MAX_FRAMES) {
             val resultRef = AtomicReference<CaptureResult?>()
-            val latch = CountDownLatch(1)
+            val resultLatch = CountDownLatch(1)
+            val imageDrainLatch = CountDownLatch(1)
+            warmDrainLatchRef.set(imageDrainLatch)
+
             val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(rawTarget)
                 val trigger = if (
@@ -267,7 +274,7 @@ class SingleRawCaptureEngine(context: Context) {
                     result: TotalCaptureResult,
                 ) {
                     resultRef.set(selectPhysicalResult(result, lens.physicalCameraId))
-                    latch.countDown()
+                    resultLatch.countDown()
                 }
 
                 override fun onCaptureFailed(
@@ -275,11 +282,15 @@ class SingleRawCaptureEngine(context: Context) {
                     request: CaptureRequest,
                     failure: CaptureFailure,
                 ) {
-                    latch.countDown()
+                    resultLatch.countDown()
                 }
             }, handler)
 
-            if (!latch.await(THREE_A_FRAME_TIMEOUT_MS, TimeUnit.MILLISECONDS)) continue
+            val resultArrived = resultLatch.await(THREE_A_FRAME_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            imageDrainLatch.await(THREE_A_DRAIN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            warmDrainLatchRef.compareAndSet(imageDrainLatch, null)
+            if (!resultArrived) continue
+
             val result = resultRef.get() ?: continue
             if (threeAReady(result, hasAutofocus)) return
             Thread.sleep(THREE_A_SETTLE_DELAY_MS)
@@ -357,6 +368,7 @@ class SingleRawCaptureEngine(context: Context) {
         const val CAPTURE_TIMEOUT_MS = 8_000L
         const val THREE_A_MAX_FRAMES = 4
         const val THREE_A_FRAME_TIMEOUT_MS = 1_500L
+        const val THREE_A_DRAIN_TIMEOUT_MS = 1_500L
         const val THREE_A_SETTLE_DELAY_MS = 80L
     }
 }
