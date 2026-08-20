@@ -6,7 +6,7 @@ import org.junit.Test
 
 class LensValueFilterTest {
     @Test
-    fun keepsTwoLearnedHiddenAuxiliariesEvenWhenMetadataMatches() {
+    fun keepsTwoHiddenAuxiliariesSeparateEvenWhenMetadataMatches() {
         val first = lens(
             id = "20",
             learned = true,
@@ -18,7 +18,7 @@ class LensValueFilterTest {
         )
         val second = lens(
             id = "22",
-            learned = true,
+            learned = false,
             focal = 1.9f,
             sensorWidth = 4.0f,
             sensorHeight = 3.0f,
@@ -26,14 +26,15 @@ class LensValueFilterTest {
             hidden = true,
         )
 
-        val result = LensValueFilter.filterForSelector(listOf(first, second))
+        val families = LensFamilyResolver.resolve(listOf(first, second))
 
-        assertEquals(listOf("20", "22"), result.map { it.cameraId })
+        assertEquals(2, families.size)
+        assertEquals(listOf("20", "22"), families.map { it.defaultRoute.cameraId })
     }
 
     @Test
-    fun learningOneHiddenAuxiliaryDoesNotEraseMatchingUnprovenAuxiliary() {
-        val learned = lens(
+    fun directAndPhysicalViaLogicalProfilesBecomeOneFamily() {
+        val direct = lens(
             id = "20",
             learned = true,
             focal = 1.9f,
@@ -42,105 +43,94 @@ class LensValueFilterTest {
             fov = 92.0f,
             hidden = true,
         )
-        val candidate = lens(
-            id = "22",
+        val viaLogical = lens(
+            id = "20",
             learned = false,
             focal = 1.9f,
             sensorWidth = 4.0f,
             sensorHeight = 3.0f,
             fov = 92.0f,
-            hidden = true,
-        )
-
-        val result = LensValueFilter.filterForSelector(listOf(learned, candidate))
-
-        assertEquals(listOf("20", "22"), result.map { it.cameraId })
-    }
-
-    @Test
-    fun missingSensorGeometryNeverCollapsesHiddenCameraBehindPublicCamera() {
-        val public = lens(
-            id = "1",
-            learned = true,
-            focal = 3.7f,
-            sensorWidth = null,
-            sensorHeight = null,
-            fov = 74.0f,
-            accessPath = CameraAccessPath.JAVA_DIRECT,
-            javaPublic = true,
-        )
-        val hidden = lens(
-            id = "101",
-            learned = false,
-            focal = 3.7f,
-            sensorWidth = null,
-            sensorHeight = null,
-            fov = 74.0f,
-            hidden = true,
-        )
-
-        val result = LensValueFilter.filterForSelector(listOf(public, hidden))
-
-        assertEquals(listOf("1", "101"), result.map { it.cameraId })
-    }
-
-    @Test
-    fun exactHiddenMirrorOfNormalPublicJavaCameraIsSuppressed() {
-        val public = lens(
-            id = "1",
-            learned = true,
-            focal = 3.7f,
-            sensorWidth = 5.0f,
-            sensorHeight = 3.8f,
-            fov = 68.0f,
-            accessPath = CameraAccessPath.JAVA_DIRECT,
-            javaPublic = true,
-        )
-        val helper = lens(
-            id = "101",
-            learned = false,
-            focal = 3.7f,
-            sensorWidth = 5.0f,
-            sensorHeight = 3.8f,
-            fov = 68.0f,
-            hidden = true,
-        )
-
-        val result = LensValueFilter.filterForSelector(listOf(public, helper))
-
-        assertEquals(listOf("1"), result.map { it.cameraId })
-    }
-
-    @Test
-    fun explicitLogicalParentCanBeSuppressedByEquivalentPhysicalChild() {
-        val logicalParent = lens(
-            id = "0",
-            learned = true,
-            focal = 4.7f,
-            sensorWidth = 5.6f,
-            sensorHeight = 4.2f,
-            fov = 61.5f,
-            accessPath = CameraAccessPath.JAVA_DIRECT,
-            javaPublic = true,
-            logical = true,
-        )
-        val physicalChild = lens(
-            id = "20",
-            learned = true,
-            focal = 4.7f,
-            sensorWidth = 5.6f,
-            sensorHeight = 4.2f,
-            fov = 61.5f,
             accessPath = CameraAccessPath.PHYSICAL_VIA_LOGICAL,
-            logical = true,
-            logicalCameraId = "0",
+            logicalCameraId = "61",
             physicalCameraId = "20",
         )
 
-        val result = LensValueFilter.filterForSelector(listOf(logicalParent, physicalChild))
+        val families = LensFamilyResolver.resolve(listOf(direct, viaLogical))
 
-        assertEquals(listOf("20"), result.map { it.cameraId })
-        assertTrue(result.none { it.cameraId == "0" })
+        assertEquals(1, families.size)
+        assertEquals("20", families.single().familyId)
+        assertEquals(direct.stableId, families.single().defaultRoute.stableId)
+        assertEquals(listOf(viaLogical.stableId), families.single().aliases.map { it.stableId })
+    }
+
+    @Test
+    fun singleChildLogicalParentBecomesAliasOfPhysicalChild() {
+        val child = lens(
+            id = "20",
+            learned = true,
+            focal = 1.9f,
+            sensorWidth = 4.0f,
+            sensorHeight = 3.0f,
+            fov = 92.0f,
+            hidden = true,
+        )
+        val parent = lens(
+            id = "61",
+            learned = true,
+            focal = 1.9f,
+            sensorWidth = 4.0f,
+            sensorHeight = 3.0f,
+            fov = 92.0f,
+            hidden = true,
+            logical = true,
+            physicalIds = setOf("20"),
+        )
+
+        val families = LensFamilyResolver.resolve(listOf(parent, child))
+
+        assertEquals(1, families.size)
+        assertEquals("20", families.single().defaultRoute.cameraId)
+        assertTrue(families.single().aliases.any { it.cameraId == "61" })
+    }
+
+    @Test
+    fun multiChildLogicalParentMergesOnlyWithUniqueOpticalChild() {
+        val parent = lens(
+            id = "60",
+            learned = false,
+            focal = 4.7f,
+            sensorWidth = 5.6f,
+            sensorHeight = 4.2f,
+            fov = 61.5f,
+            hidden = true,
+            logical = true,
+            physicalIds = setOf("20", "21"),
+        )
+        val matchingChild = lens(
+            id = "20",
+            learned = true,
+            focal = 4.7f,
+            sensorWidth = 5.6f,
+            sensorHeight = 4.2f,
+            fov = 61.5f,
+            hidden = true,
+        )
+        val differentChild = lens(
+            id = "21",
+            learned = true,
+            focal = 1.6f,
+            sensorWidth = 4.0f,
+            sensorHeight = 3.0f,
+            fov = 102.0f,
+            hidden = true,
+        )
+
+        val families = LensFamilyResolver.resolve(listOf(parent, matchingChild, differentChild))
+
+        assertEquals(2, families.size)
+        val mainFamily = families.first { it.defaultRoute.cameraId == "20" }
+        assertTrue(mainFamily.aliases.any { it.cameraId == "60" })
+        assertTrue(families.any { it.defaultRoute.cameraId == "21" })
     }
 
     private fun lens(
@@ -154,6 +144,7 @@ class LensValueFilterTest {
         hidden: Boolean = false,
         javaPublic: Boolean = false,
         logical: Boolean = false,
+        physicalIds: Set<String> = emptySet(),
         logicalCameraId: String = id,
         physicalCameraId: String? = null,
     ): LensCapability = LensCapability(
@@ -186,6 +177,7 @@ class LensValueFilterTest {
         burstCapture = false,
         maxResolutionSensor = false,
         isLogicalMultiCamera = logical,
+        logicalPhysicalIds = physicalIds,
         usableForPreview = true,
         qualification = LensQualification(
             accessPathOpenQualified = learned,
