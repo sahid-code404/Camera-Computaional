@@ -8,7 +8,7 @@ import org.json.JSONObject
 /** Produces a portable Phase-01 discovery/session report for physical-device testing. */
 object CameraDiagnostics {
     fun toJson(report: CameraQualificationReport): String = JSONObject().apply {
-        put("schemaVersion", 2)
+        put("schemaVersion", 3)
         put("generatedAtUnixMs", System.currentTimeMillis())
         put("device", JSONObject().apply {
             put("manufacturer", Build.MANUFACTURER)
@@ -41,8 +41,24 @@ object CameraDiagnostics {
             put("ndkOnlyDirectCount", report.discovery.ndkDirectIds.count {
                 it !in report.discovery.javaDirectIds
             })
+            put("nativePreviewQualifiedCount", report.candidates.count {
+                it.accessPath == CameraAccessPath.NDK_DIRECT && it.qualification.previewSessionQualified
+            })
+            put("yuvFallbackVisibleCount", report.visibleLenses.count {
+                !it.qualification.previewSessionQualified && it.qualification.yuvSessionQualified
+            })
         })
-        put("visibleLensIds", stringArray(report.visibleLenses.map { it.cameraId }))
+        put("visibleLenses", JSONArray().apply {
+            report.visibleLenses.forEach { lens ->
+                put(JSONObject().apply {
+                    put("cameraId", lens.cameraId)
+                    put("displayName", lens.displayName)
+                    put("accessPath", lens.accessPath.name)
+                    put("renderMode", renderMode(lens))
+                    put("horizontalFovDegrees", lens.horizontalFovDegrees ?: JSONObject.NULL)
+                })
+            }
+        })
         put("candidates", JSONArray().apply {
             report.candidates.forEach { lens -> put(lensToJson(lens)) }
         })
@@ -58,6 +74,9 @@ object CameraDiagnostics {
         put("displayName", lens.displayName)
         put("facing", facingLabel(lens.facing))
         put("focalLengthMm", lens.focalLengthMm ?: JSONObject.NULL)
+        put("sensorWidthMm", lens.sensorWidthMm ?: JSONObject.NULL)
+        put("sensorHeightMm", lens.sensorHeightMm ?: JSONObject.NULL)
+        put("horizontalFovDegrees", lens.horizontalFovDegrees ?: JSONObject.NULL)
         put("logicalMultiCamera", lens.isLogicalMultiCamera)
         put("metadataPreviewCandidate", lens.usableForPreview)
         put("previewSizeCount", lens.previewSizes.size)
@@ -72,6 +91,8 @@ object CameraDiagnostics {
         put("ultraHighResolutionSensor", lens.maxResolutionSensor)
         put("nativeHardwareLevel", lens.nativeHardwareLevel ?: JSONObject.NULL)
         put("nativeCharacteristicsStatus", lens.nativeCharacteristicsStatus ?: JSONObject.NULL)
+        put("userVisible", lens.userVisible)
+        put("renderMode", renderMode(lens))
         put("qualification", JSONObject().apply {
             put("accessPathOpenQualified", lens.qualification.accessPathOpenQualified)
             put("previewSessionQualified", lens.qualification.previewSessionQualified)
@@ -81,6 +102,17 @@ object CameraDiagnostics {
             put("detail", lens.qualification.detail)
             put("checkedAtElapsedRealtimeMs", lens.qualification.checkedAtElapsedRealtimeMs)
         })
+    }
+
+    private fun renderMode(lens: LensCapability): String = when {
+        lens.qualification.previewSessionQualified && lens.accessPath == CameraAccessPath.NDK_DIRECT ->
+            "NDK_SURFACE"
+        lens.qualification.previewSessionQualified -> "CAMERA2_SURFACE"
+        lens.qualification.yuvSessionQualified && lens.accessPath == CameraAccessPath.NDK_DIRECT ->
+            "NDK_YUV_CPU"
+        lens.qualification.yuvSessionQualified -> "CAMERA2_YUV_CPU"
+        lens.qualification.rawSessionQualified -> "RAW_DIAGNOSTIC_ONLY"
+        else -> "NONE"
     }
 
     private fun sizeJson(size: android.util.Size): JSONObject = JSONObject()
