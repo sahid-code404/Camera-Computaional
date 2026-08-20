@@ -7,13 +7,15 @@ import kotlin.math.max
 /**
  * MotionCam-style lens-family resolver.
  *
- * Camera IDs are transport endpoints, not necessarily physical lenses. One sensor can be reachable
- * through several endpoint/profile combinations (for example direct NDK plus physical-via-logical),
- * while two genuinely different sensors can report almost identical focal/sensor metadata.
+ * A camera ID is the target lens identity. The same target can have multiple access profiles:
+ * JAVA_DIRECT, NDK_DIRECT, or PHYSICAL_VIA_LOGICAL (for example target 20 through logical parent
+ * 61 is the profile "61/20"). Those profiles belong to the same family because their cameraId is
+ * the same target sensor.
  *
- * This resolver therefore keeps every endpoint/profile internally and exposes one default route per
- * family. Cross-ID grouping requires explicit topology or a very strong public<->hidden mirror
- * signature; hidden auxiliaries are never merged with each other from optics alone.
+ * A logical parent ID is NOT automatically the same family as one of its physical children. Direct
+ * logical output can represent a different/composite/default view. Cross-ID family merging is only
+ * allowed for a very strong public-Java <-> alternate-NDK mirror signature. Hidden auxiliaries are
+ * never merged with each other from optics alone.
  */
 data class LensFamily(
     val familyId: String,
@@ -46,58 +48,27 @@ object LensFamilyResolver {
             if (leftRoot != rightRoot) parent[rightRoot] = leftRoot
         }
 
-        val byId = usable.groupBy { it.cameraId }
+        // Same target cameraId is already one family because grouping happens on find(cameraId).
+        // A PHYSICAL_VIA_LOGICAL route keeps cameraId=physical target and logicalCameraId=parent,
+        // exactly matching MotionCam's "parent/physical" profile model.
 
-        // Explicit logical topology is the strongest family evidence. A logical parent with one
-        // exposed child is an alias/profile of that child. With several children we merge the
-        // parent only when exactly one child matches the parent's optical identity.
-        usable
-            .filter { it.physicalCameraId == null && it.logicalPhysicalIds.isNotEmpty() }
-            .forEach { logical ->
-                val children = logical.logicalPhysicalIds.filter { it in byId }
-                when {
-                    children.size == 1 -> union(logical.cameraId, children.single())
-                    children.size > 1 -> {
-                        val matchingChildren = children.filter { childId ->
-                            byId[childId].orEmpty().any { child -> opticalEquivalent(logical, child) }
-                        }
-                        if (matchingChildren.size == 1) {
-                            union(logical.cameraId, matchingChildren.single())
-                        }
-                    }
-                }
-            }
-
-        // A PHYSICAL_VIA_LOGICAL route explicitly says "open logical X, render physical Y". If a
-        // direct route for X is also present and represents the same view, X is a parent alias of Y.
-        usable
-            .filter { it.physicalCameraId != null && it.logicalCameraId != it.cameraId }
-            .forEach { physicalRoute ->
-                byId[physicalRoute.logicalCameraId].orEmpty().forEach { logicalRoute ->
-                    val explicitChild = physicalRoute.cameraId in logicalRoute.logicalPhysicalIds
-                    if (explicitChild || opticalEquivalent(logicalRoute, physicalRoute)) {
-                        union(logicalRoute.cameraId, physicalRoute.cameraId)
-                    }
-                }
-            }
-
-        // OEMs sometimes publish a normal Java endpoint and also expose a hidden NDK mirror of the
-        // same sensor. Treat it as the same family only when the hardware/stream signature is very
-        // strong. Hidden<->hidden routes are intentionally excluded: two real aux modules may use
-        // the exact same sensor model and optics.
+        // OEMs can also publish a normal Java endpoint and expose an alternate NDK endpoint that is
+        // effectively a mirror of the same sensor. Merge those different IDs only with a very strong
+        // hardware + stream signature. NDK<->NDK is intentionally excluded because two genuine aux
+        // modules can use identical sensor models and optics.
         val publicJava = usable.filter(::isNormalPublicJava)
-        val hiddenDirect = usable.filter(::isHiddenDirect)
-        hiddenDirect.forEach { hidden ->
+        val alternateNdk = usable.filter(::isAlternateNdkDirect)
+        alternateNdk.forEach { alternate ->
             publicJava.forEach { public ->
-                if (strongMirrorEquivalent(hidden, public)) {
-                    union(hidden.cameraId, public.cameraId)
+                if (strongMirrorEquivalent(alternate, public)) {
+                    union(alternate.cameraId, public.cameraId)
                 }
             }
         }
 
         val groups = usable.groupBy { find(it.cameraId) }
         return groups.values
-            .map { familyRoutes -> buildFamily(familyRoutes) }
+            .map(::buildFamily)
             .sortedWith(
                 compareBy<LensFamily> { cameraSortKey(it.defaultRoute) }
                     .thenBy { it.familyId }
@@ -134,8 +105,7 @@ object LensFamilyResolver {
 
     private fun buildFamily(routes: List<LensCapability>): LensFamily {
         val canonicalId = canonicalCameraId(routes)
-        val canonicalRoutes = routes.filter { it.cameraId == canonicalId }
-            .ifEmpty { routes }
+        val canonicalRoutes = routes.filter { it.cameraId == canonicalId }.ifEmpty { routes }
         val default = canonicalRoutes.minByOrNull(::routeScore) ?: routes.first()
         val aliases = routes
             .filterNot { it.stableId == default.stableId }
@@ -150,21 +120,8 @@ object LensFamilyResolver {
     private fun canonicalCameraId(routes: List<LensCapability>): String {
         val routeIds = routes.mapTo(linkedSetOf()) { it.cameraId }
 
-        // If one ID is explicitly named as a physical child by another route in this family, the
-        // child is the lens identity; the logical parent is only another profile.
-        val explicitChildren = routes
-            .flatMap { it.logicalPhysicalIds }
-            .filter { it in routeIds }
-            .toSet()
-        if (explicitChildren.size == 1) return explicitChildren.single()
-
-        routes.firstOrNull { route ->
-            route.physicalCameraId != null && route.physicalCameraId == route.cameraId
-        }?.let { return it.cameraId }
-
-        // For a public<->hidden mirror family, the normal public Java endpoint is the default
-        // identity. This keeps stable user-facing labels while retaining the hidden NDK route as a
-        // fallback profile.
+        // A public<->NDK mirror family keeps the normal public Java ID as the stable user-facing
+        // identity. Alternate native routes remain internal profiles/fallbacks.
         val publicIds = routes.filter(::isNormalPublicJava).map { it.cameraId }.distinct()
         if (publicIds.size == 1 && routeIds.size > 1) return publicIds.single()
 
@@ -181,8 +138,9 @@ object LensFamilyResolver {
             CameraAccessPath.PHYSICAL_VIA_LOGICAL -> 20
         }
 
+        // For the same target sensor, direct access is the default and parent/physical routing is a
+        // retained profile. A learned alternate can still win if the direct route has never worked.
         if (lens.physicalCameraId != null) score += 15
-        if (lens.isLogicalMultiCamera && lens.logicalPhysicalIds.isNotEmpty()) score += 40
         if (CameraDiscoverySource.HIDDEN_ID_PROBE in lens.discoverySources) score += 8
         if (CameraDiscoverySource.CANDIDATE_CACHE in lens.discoverySources) score += 3
         return score
@@ -221,9 +179,10 @@ object LensFamilyResolver {
         compareLargest(left.yuvSizes, right.yuvSizes)
         compareLargest(left.rawSizes, right.rawSizes)
 
-        // PRIVATE + YUV normally gives two independent pieces of stream evidence. If only one
-        // category exists, don't guess that two separate physical modules are aliases.
-        return comparable >= 2 && matches == comparable
+        // Two matching stream classes are enough to call this the same sensor profile. This allows
+        // PRIVATE preview constraints to differ between Java/NDK wrappers while YUV/RAW still prove
+        // the underlying hardware identity.
+        return comparable >= 2 && matches >= 2
     }
 
     private fun sensorGeometryCompatible(
@@ -240,10 +199,10 @@ object LensFamilyResolver {
             relativeDelta(leftHeight, rightHeight) <= tolerance
     }
 
-    private fun isHiddenDirect(lens: LensCapability): Boolean =
+    private fun isAlternateNdkDirect(lens: LensCapability): Boolean =
         lens.physicalCameraId == null &&
             lens.accessPath == CameraAccessPath.NDK_DIRECT &&
-            CameraDiscoverySource.HIDDEN_ID_PROBE in lens.discoverySources
+            CameraDiscoverySource.JAVA_DIRECT !in lens.discoverySources
 
     private fun isNormalPublicJava(lens: LensCapability): Boolean =
         lens.physicalCameraId == null &&
