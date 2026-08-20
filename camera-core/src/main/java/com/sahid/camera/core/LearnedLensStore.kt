@@ -10,10 +10,9 @@ import org.json.JSONObject
 /**
  * Small per-build topology cache used only to make camera startup fast.
  *
- * Deep discovery is expensive on OEMs that hide auxiliary IDs. Once a route has produced a
- * real frame, we remember the exact route for this Build.FINGERPRINT. A ROM/OTA fingerprint
- * change automatically invalidates it. The selected preview still performs a real camera open,
- * so stale hardware state cannot silently produce frames from the wrong endpoint.
+ * Once a route has produced a usable preview/YUV result, remember it for this exact
+ * Build.FINGERPRINT. A ROM/OTA fingerprint change invalidates it automatically. Fast startup can
+ * therefore restore proven lenses without repeating session qualification or hidden-ID scanning.
  */
 class LearnedLensStore(context: Context) {
     private val appContext = context.applicationContext
@@ -46,9 +45,23 @@ class LearnedLensStore(context: Context) {
             ?: Snapshot(deepScanCompleted = false, routes = emptyList())
     }
 
-    /** Save only routes that already produced a usable preview/YUV frame in the deep pass. */
+    /** Save only routes that already produced a usable preview/YUV result in the deep pass. */
     fun saveDeepScan(report: CameraQualificationReport) {
         saveRoutes(report.visibleLenses, deepScanCompleted = true)
+    }
+
+    /**
+     * Fast/public discovery also teaches the cache. This is what makes the second launch instant
+     * even when the user never needed the explicit hidden-lens scan.
+     */
+    fun mergeProvenRoutes(routes: List<LensCapability>) {
+        val current = load()
+        val merged = (current.routes + routes)
+            .filter { it.userVisible }
+            .groupBy { it.cameraId }
+            .values
+            .mapNotNull { candidates -> candidates.minByOrNull(::legacyRouteScore) }
+        saveRoutes(merged, deepScanCompleted = current.deepScanCompleted)
     }
 
     fun clearCurrentBuild() {
