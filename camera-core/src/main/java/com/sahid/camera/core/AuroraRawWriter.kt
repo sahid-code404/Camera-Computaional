@@ -31,13 +31,12 @@ import java.util.Locale
  *   N bytes  UTF-8 JSON metadata
  *   M bytes  exact RAW plane payload
  *
- * Android 10+ publishes AURAW through MediaStore.Downloads. AURAW is a generic binary source
- * record, not a rendered image, so Download/Aurora/RAW is the portable scoped-storage destination
- * across OEMs. A separate best-effort JPEG preview may be derived from the SAME packet for human
- * inspection; that JPEG is explicitly non-canonical and never feeds Aurora's computational path.
+ * Storage policy intentionally separates representation from source truth:
+ * - DCIM/Camera contains the normal user-facing rendition that Gallery/Photos apps index.
+ * - Documents/Camera/RAW contains the canonical AURAW master because AURAW is a generic binary
+ *   document, not an image MIME type. Aurora's own gallery will present both as one capture.
  */
 object AuroraRawWriter {
-    private const val PUBLIC_RELATIVE_DIRECTORY = "Download/Aurora/RAW"
     private const val MIME_TYPE_AURAW = "application/octet-stream"
 
     private val magic = byteArrayOf(
@@ -58,7 +57,7 @@ object AuroraRawWriter {
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
         val lensId = lens.cameraId.replace(Regex("[^A-Za-z0-9._-]"), "_")
         val fileName = "AURORA_${stamp}_ID-${lensId}.auraw"
-        val previewFileName = "AURORA_${stamp}_ID-${lensId}_preview.jpg"
+        val previewFileName = "IMG_${stamp}_AURORA.jpg"
 
         val metadata = JSONObject()
             .put("container", "AURAW")
@@ -81,12 +80,14 @@ object AuroraRawWriter {
             .put("payloadSha256", digest)
             .put("buildFingerprint", Build.FINGERPRINT)
             .put("sdkInt", Build.VERSION.SDK_INT)
+            .put("canonicalRelativePath", CameraStoragePolicy.CANONICAL_RAW_RELATIVE_PATH)
             .put(
                 "derivedPreview",
                 JSONObject()
                     .put("canonical", false)
                     .put("feedsComputationalPipeline", false)
                     .put("fileName", previewFileName)
+                    .put("relativePath", CameraStoragePolicy.VISIBLE_ALBUM_RELATIVE_PATH)
                     .put("renderer", "AURORA_PHASE02_BAYER_QUALIFICATION_PREVIEW"),
             )
             .put("staticMetadata", staticMetadata)
@@ -95,7 +96,7 @@ object AuroraRawWriter {
         val metadataBytes = metadata.toString().toByteArray(Charsets.UTF_8)
         val displayFile = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             writeMediaStore(context, fileName, metadataBytes, packet.bytes)
-            File("/$PUBLIC_RELATIVE_DIRECTORY", fileName)
+            File("/${CameraStoragePolicy.CANONICAL_RAW_RELATIVE_PATH}", fileName)
         } else {
             writeLegacyAppSpecific(context, fileName, metadataBytes, packet.bytes)
         }
@@ -136,16 +137,16 @@ object AuroraRawWriter {
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
             put(MediaStore.MediaColumns.MIME_TYPE, MIME_TYPE_AURAW)
-            put(MediaStore.MediaColumns.RELATIVE_PATH, PUBLIC_RELATIVE_DIRECTORY)
+            put(MediaStore.MediaColumns.RELATIVE_PATH, CameraStoragePolicy.CANONICAL_RAW_RELATIVE_PATH)
             put(MediaStore.MediaColumns.IS_PENDING, 1)
         }
-        val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        val collection = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
         val uri = resolver.insert(collection, values)
-            ?: throw IllegalStateException("MediaStore Downloads refused RAW destination")
+            ?: throw IllegalStateException("MediaStore Files refused canonical RAW destination")
 
         try {
             val stream = resolver.openOutputStream(uri, "w")
-                ?: throw IllegalStateException("Unable to open MediaStore RAW destination")
+                ?: throw IllegalStateException("Unable to open canonical RAW destination")
             DataOutputStream(BufferedOutputStream(stream)).use { output ->
                 writeContainer(output, metadataBytes, payload)
             }
@@ -154,7 +155,7 @@ object AuroraRawWriter {
                 put(MediaStore.MediaColumns.IS_PENDING, 0)
             }
             val updated = resolver.update(uri, publishValues, null, null)
-            check(updated == 1) { "Unable to publish completed RAW record" }
+            check(updated == 1) { "Unable to publish completed RAW master" }
         } catch (t: Throwable) {
             runCatching { resolver.delete(uri, null, null) }
             throw t
@@ -167,8 +168,8 @@ object AuroraRawWriter {
         metadataBytes: ByteArray,
         payload: ByteArray,
     ): File {
-        val external = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
-        val directory = File(external ?: context.filesDir, "Aurora/RAW")
+        val external = context.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS)
+        val directory = File(external ?: context.filesDir, "Camera/RAW")
         if (!directory.exists() && !directory.mkdirs()) {
             throw IllegalStateException("Unable to create ${directory.absolutePath}")
         }
