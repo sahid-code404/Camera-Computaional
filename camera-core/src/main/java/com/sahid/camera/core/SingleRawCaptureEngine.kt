@@ -30,15 +30,23 @@ import java.util.concurrent.atomic.AtomicReference
 /**
  * Phase 02A: one persisted RAW_SENSOR exposure -> one standards-compatible DNG.
  *
- * A dedicated RAW session is warmed before the final exposure so a newly opened camera does not
- * capture at an arbitrary/default focus position. Warm-up frames are drained and discarded in
- * memory; only the final timestamp-matched RAW image is persisted as DNG.
+ * The dedicated RAW session now performs a real autofocus lock before the final exposure and keeps
+ * that exact focus position through the capture. This avoids the previous failure mode where the
+ * warm-up request used continuous AF and the final still request could start another lens scan just
+ * as the RAW frame was exposed.
+ *
+ * Tap-to-focus is represented as a normalized [FocusMeteringPoint]. The point is applied both to
+ * the live preview session and again here after the preview CameraDevice has been released, so a
+ * selected auxiliary/physical lens focuses the same subject for the canonical RAW exposure.
  */
 class SingleRawCaptureEngine(context: Context) {
     private val appContext = context.applicationContext
     private val manager = appContext.getSystemService(CameraManager::class.java)
 
-    fun capture(lens: LensCapability): RawCaptureOutcome {
+    fun capture(
+        lens: LensCapability,
+        focusPoint: FocusMeteringPoint? = null,
+    ): RawCaptureOutcome {
         if (ContextCompat.checkSelfPermission(appContext, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             return RawCaptureOutcome.Failure("Camera permission is required")
         }
@@ -53,7 +61,7 @@ class SingleRawCaptureEngine(context: Context) {
 
         val surfaceRotationDegrees = DeviceOrientationTracker.surfaceRotationDegrees
         return try {
-            RawCaptureOutcome.Success(captureJavaDng(lens, surfaceRotationDegrees))
+            RawCaptureOutcome.Success(captureJavaDng(lens, surfaceRotationDegrees, focusPoint?.clamped()))
         } catch (t: Throwable) {
             RawCaptureOutcome.Failure(t.message ?: t.javaClass.simpleName, t)
         }
@@ -62,6 +70,7 @@ class SingleRawCaptureEngine(context: Context) {
     private fun captureJavaDng(
         lens: LensCapability,
         surfaceRotationDegrees: Int,
+        focusPoint: FocusMeteringPoint?,
     ): RawCaptureRecord {
         val rawSize = chooseRawSize(lens.rawSizes)
         val thread = HandlerThread("AuroraDngCapture").apply { start() }
@@ -151,7 +160,7 @@ class SingleRawCaptureEngine(context: Context) {
             sessionError.get()?.let { error(it) }
             val session = sessionRef.get() ?: error("DNG session unavailable")
 
-            warmThreeA(
+            val threeA = warmThreeA(
                 camera = camera,
                 session = session,
                 rawTarget = reader.surface,
@@ -159,7 +168,14 @@ class SingleRawCaptureEngine(context: Context) {
                 characteristics = characteristics,
                 handler = handler,
                 warmDrainLatchRef = warmDrainLatchRef,
+                focusPoint = focusPoint,
             )
+
+            // Do not knowingly persist a defocused RAW. Fixed-focus lenses bypass this gate, and
+            // OEMs that omit AF state are accepted, but an explicit scanning/failed state must lock.
+            if (threeA.autofocusSupported && !threeA.autofocusLocked) {
+                error("Autofocus did not lock; tap the subject and try again")
+            }
 
             // No discarded warm-up image is allowed to remain queued when the final gate opens.
             warmDrainLatchRef.getAndSet(null)?.await(THREE_A_DRAIN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
@@ -174,7 +190,13 @@ class SingleRawCaptureEngine(context: Context) {
             acceptFinalImage.set(true)
             val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(reader.surface)
-                applyThreeAControls(this, characteristics, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
+                applyFinalCaptureControls(
+                    builder = this,
+                    characteristics = characteristics,
+                    lens = lens,
+                    focusPoint = focusPoint,
+                    lockedFocusDistance = threeA.lockedFocusDistance,
+                )
                 runCatching { set(CaptureRequest.JPEG_ORIENTATION, captureOrientationDegrees) }
                 runCatching {
                     set(
@@ -243,10 +265,10 @@ class SingleRawCaptureEngine(context: Context) {
         characteristics: CameraCharacteristics,
         handler: Handler,
         warmDrainLatchRef: AtomicReference<CountDownLatch?>,
-    ) {
-        val afModes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
-            ?.toSet().orEmpty()
-        val hasAutofocus = afModes.any { it != CaptureRequest.CONTROL_AF_MODE_OFF }
+        focusPoint: FocusMeteringPoint?,
+    ): ThreeAState {
+        val autofocusSupported = FocusMetering.supportsAutofocus(characteristics)
+        var latestResult: CaptureResult? = null
 
         for (attempt in 0 until THREE_A_MAX_FRAMES) {
             val resultRef = AtomicReference<CaptureResult?>()
@@ -256,15 +278,18 @@ class SingleRawCaptureEngine(context: Context) {
 
             val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(rawTarget)
-                val trigger = if (
-                    attempt == 0 &&
-                    CaptureRequest.CONTROL_AF_MODE_AUTO in afModes
-                ) {
+                val trigger = if (autofocusSupported && (attempt == 0 || attempt == THREE_A_RETRIGGER_FRAME)) {
                     CaptureRequest.CONTROL_AF_TRIGGER_START
                 } else {
                     CaptureRequest.CONTROL_AF_TRIGGER_IDLE
                 }
-                applyThreeAControls(this, characteristics, trigger)
+                applyThreeAControls(
+                    builder = this,
+                    characteristics = characteristics,
+                    lens = lens,
+                    afTrigger = trigger,
+                    focusPoint = focusPoint,
+                )
             }.build()
 
             session.capture(request, object : CameraCaptureSession.CaptureCallback() {
@@ -292,41 +317,109 @@ class SingleRawCaptureEngine(context: Context) {
             if (!resultArrived) continue
 
             val result = resultRef.get() ?: continue
-            if (threeAReady(result, hasAutofocus)) return
+            latestResult = result
+            if (threeAReady(result, autofocusSupported)) {
+                return ThreeAState(
+                    autofocusSupported = autofocusSupported,
+                    autofocusLocked = autofocusReady(result, autofocusSupported),
+                    lockedFocusDistance = result.get(CaptureResult.LENS_FOCUS_DISTANCE),
+                )
+            }
             Thread.sleep(THREE_A_SETTLE_DELAY_MS)
         }
+
+        return ThreeAState(
+            autofocusSupported = autofocusSupported,
+            autofocusLocked = autofocusReady(latestResult, autofocusSupported),
+            lockedFocusDistance = latestResult?.get(CaptureResult.LENS_FOCUS_DISTANCE),
+        )
     }
 
     private fun applyThreeAControls(
         builder: CaptureRequest.Builder,
         characteristics: CameraCharacteristics,
+        lens: LensCapability,
         afTrigger: Int,
+        focusPoint: FocusMeteringPoint?,
     ) {
-        builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-        builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-        builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+        val physicalId = lens.physicalCameraId
+        FocusMetering.set(builder, CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO, physicalId)
+        FocusMetering.set(builder, CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON, physicalId)
+        FocusMetering.set(builder, CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO, physicalId)
 
-        val afModes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
-            ?.toSet().orEmpty()
-        when {
-            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE in afModes ->
-                builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-            CaptureRequest.CONTROL_AF_MODE_AUTO in afModes ->
-                builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
-            else -> builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+        val afMode = if (FocusMetering.supportsAutofocus(characteristics)) {
+            FocusMetering.lockAfMode(characteristics)
+        } else {
+            CaptureRequest.CONTROL_AF_MODE_OFF
         }
-        if (afTrigger != CaptureRequest.CONTROL_AF_TRIGGER_IDLE || CaptureRequest.CONTROL_AF_MODE_AUTO in afModes) {
-            runCatching { builder.set(CaptureRequest.CONTROL_AF_TRIGGER, afTrigger) }
+        FocusMetering.set(builder, CaptureRequest.CONTROL_AF_MODE, afMode, physicalId)
+        FocusMetering.applyRegions(builder, characteristics, physicalId, focusPoint)
+        if (afMode != CaptureRequest.CONTROL_AF_MODE_OFF) {
+            FocusMetering.set(builder, CaptureRequest.CONTROL_AF_TRIGGER, afTrigger, physicalId)
+        }
+        applyOpticalStabilization(builder, characteristics, physicalId)
+    }
+
+    private fun applyFinalCaptureControls(
+        builder: CaptureRequest.Builder,
+        characteristics: CameraCharacteristics,
+        lens: LensCapability,
+        focusPoint: FocusMeteringPoint?,
+        lockedFocusDistance: Float?,
+    ) {
+        val physicalId = lens.physicalCameraId
+        FocusMetering.set(builder, CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO, physicalId)
+        FocusMetering.set(builder, CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON, physicalId)
+        FocusMetering.set(builder, CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO, physicalId)
+        FocusMetering.applyRegions(builder, characteristics, physicalId, focusPoint)
+        applyOpticalStabilization(builder, characteristics, physicalId)
+
+        val afModes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)?.toSet().orEmpty()
+        val canFreezeDistance = lockedFocusDistance != null && CaptureRequest.CONTROL_AF_MODE_OFF in afModes
+        if (canFreezeDistance) {
+            // Freeze the exact distance reported by the successful AF lock. This is still sensor/lens
+            // control only; no sharpening or rendered-image processing is applied to the RAW buffer.
+            FocusMetering.set(builder, CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF, physicalId)
+            FocusMetering.set(builder, CaptureRequest.LENS_FOCUS_DISTANCE, lockedFocusDistance!!, physicalId)
+        } else {
+            val afMode = if (FocusMetering.supportsAutofocus(characteristics)) {
+                FocusMetering.lockAfMode(characteristics)
+            } else {
+                CaptureRequest.CONTROL_AF_MODE_OFF
+            }
+            FocusMetering.set(builder, CaptureRequest.CONTROL_AF_MODE, afMode, physicalId)
+            if (afMode != CaptureRequest.CONTROL_AF_MODE_OFF) {
+                // IDLE preserves the existing AUTO lock; unlike the previous continuous-picture
+                // final request it does not deliberately start a fresh focus scan at exposure time.
+                FocusMetering.set(
+                    builder,
+                    CaptureRequest.CONTROL_AF_TRIGGER,
+                    CaptureRequest.CONTROL_AF_TRIGGER_IDLE,
+                    physicalId,
+                )
+            }
         }
     }
 
-    private fun threeAReady(result: CaptureResult, hasAutofocus: Boolean): Boolean {
-        val afState = result.get(CaptureResult.CONTROL_AF_STATE)
-        val afReady = !hasAutofocus || afState == null || when (afState) {
-            CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED,
-            CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED -> true
-            else -> false
+    private fun applyOpticalStabilization(
+        builder: CaptureRequest.Builder,
+        characteristics: CameraCharacteristics,
+        physicalCameraId: String?,
+    ) {
+        val modes = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+            ?.toSet().orEmpty()
+        if (CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON in modes) {
+            FocusMetering.set(
+                builder,
+                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON,
+                physicalCameraId,
+            )
         }
+    }
+
+    private fun threeAReady(result: CaptureResult, autofocusSupported: Boolean): Boolean {
+        val afReady = autofocusReady(result, autofocusSupported)
 
         val aeState = result.get(CaptureResult.CONTROL_AE_STATE)
         val aeReady = aeState == null || when (aeState) {
@@ -343,6 +436,16 @@ class SingleRawCaptureEngine(context: Context) {
             else -> false
         }
         return afReady && aeReady && awbReady
+    }
+
+    private fun autofocusReady(result: CaptureResult?, autofocusSupported: Boolean): Boolean {
+        if (!autofocusSupported) return true
+        val afState = result?.get(CaptureResult.CONTROL_AF_STATE) ?: return true
+        return when (afState) {
+            CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED,
+            CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED -> true
+            else -> false
+        }
     }
 
     @Suppress("DEPRECATION")
@@ -362,13 +465,20 @@ class SingleRawCaptureEngine(context: Context) {
         sizes.maxByOrNull { it.width.toLong() * it.height.toLong() }
             ?: error("No RAW_SENSOR size")
 
+    private data class ThreeAState(
+        val autofocusSupported: Boolean,
+        val autofocusLocked: Boolean,
+        val lockedFocusDistance: Float?,
+    )
+
     private companion object {
         const val OPEN_TIMEOUT_MS = 4_000L
         const val SESSION_TIMEOUT_MS = 4_000L
         const val CAPTURE_TIMEOUT_MS = 8_000L
-        const val THREE_A_MAX_FRAMES = 4
+        const val THREE_A_MAX_FRAMES = 7
+        const val THREE_A_RETRIGGER_FRAME = 4
         const val THREE_A_FRAME_TIMEOUT_MS = 1_500L
         const val THREE_A_DRAIN_TIMEOUT_MS = 1_500L
-        const val THREE_A_SETTLE_DELAY_MS = 80L
+        const val THREE_A_SETTLE_DELAY_MS = 90L
     }
 }
