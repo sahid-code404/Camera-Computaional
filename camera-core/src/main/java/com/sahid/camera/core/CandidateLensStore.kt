@@ -13,6 +13,11 @@ import org.json.JSONObject
  * normal selector. [LensFamilyResolver] decides which route is the default for each user-facing lens
  * family. Keeping aliases here means restart never destroys alternate routes that may later be
  * useful as compatibility fallbacks.
+ *
+ * The cache is also tied to [LensFamilyPolicy.CLASSIFIER_VERSION]. A ROM fingerprint can stay the
+ * same across app updates while Aurora's family semantics improve; stale metadata decisions must not
+ * survive that change. Learned routes are stored separately and remain valid because they have
+ * actual-frame evidence.
  */
 class CandidateLensStore(context: Context) {
     private val prefs = context.applicationContext
@@ -26,9 +31,8 @@ class CandidateLensStore(context: Context) {
     fun load(): List<LensCapability> = loadSnapshot().routes
 
     /**
-     * A completed automatic metadata pass is valid only for the current Build.FINGERPRINT because
-     * this SharedPreferences payload is keyed by that fingerprint. This lets normal launches skip
-     * the 0..255 pass entirely after the first successful discovery.
+     * A completed automatic metadata pass is valid only for the current Build.FINGERPRINT and the
+     * current family-classifier version.
      */
     fun hasCompletedAutoScan(): Boolean = loadSnapshot().autoScanCompleted
 
@@ -74,6 +78,9 @@ class CandidateLensStore(context: Context) {
             ?: return Snapshot(emptyList(), autoScanCompleted = false)
         return runCatching {
             val root = JSONObject(raw)
+            if (root.optInt("classifierVersion", 0) != LensFamilyPolicy.CLASSIFIER_VERSION) {
+                return@runCatching Snapshot(emptyList(), autoScanCompleted = false)
+            }
             Snapshot(
                 routes = root.optJSONArray("routes")?.let(::parseRoutes).orEmpty(),
                 autoScanCompleted = root.optBoolean("autoScanCompleted", false),
@@ -83,7 +90,8 @@ class CandidateLensStore(context: Context) {
 
     private fun save(routes: List<LensCapability>, autoScanCompleted: Boolean) {
         val payload = JSONObject()
-            .put("schemaVersion", 2)
+            .put("schemaVersion", 3)
+            .put("classifierVersion", LensFamilyPolicy.CLASSIFIER_VERSION)
             .put("buildFingerprint", Build.FINGERPRINT)
             .put("savedAtUnixMs", System.currentTimeMillis())
             .put("autoScanCompleted", autoScanCompleted)
