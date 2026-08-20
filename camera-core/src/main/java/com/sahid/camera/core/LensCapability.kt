@@ -17,6 +17,7 @@ data class LensCapability(
     val maxResolutionSensor: Boolean,
     val isLogicalMultiCamera: Boolean,
     val usableForPreview: Boolean,
+    val qualification: LensQualification = LensQualification.unqualified(),
 ) {
     val stableId: String = buildString {
         append(logicalCameraId)
@@ -26,4 +27,10 @@ data class LensCapability(
 
     val isFrontFacing: Boolean
         get() = facing == CameraCharacteristics.LENS_FACING_FRONT
+
+    val userVisible: Boolean
+        get() = usableForPreview && qualification.previewSessionQualified
+
+    val rawUsable: Boolean
+        get() = rawSupported && qualification.rawSessionQualified
 }

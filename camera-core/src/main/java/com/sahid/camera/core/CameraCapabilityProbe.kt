@@ -5,22 +5,62 @@ import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
-import android.util.Size
 
 /**
- * Foundation capability probe.
+ * Camera2 capability discovery plus Phase-01 runtime session qualification.
  *
- * Important: this intentionally does not expose CameraManager IDs directly to the UI.
- * It expands logical cameras into physical members when the framework exposes them and
- * only returns candidates that advertise a preview-compatible stream.
- *
- * A later phase must add explicit session-combination validation and persistent device
- * fingerprint caching before a lens is considered fully qualified for RAW capture.
+ * Static metadata is used to discover candidates. User-visible results must come from
+ * [probeQualifiedLenses], which verifies real preview sessions and preview+RAW session
+ * combinations before exposing a lens or RAW badge.
  */
 class CameraCapabilityProbe(context: Context) {
-    private val manager = context.getSystemService(CameraManager::class.java)
+    private val appContext = context.applicationContext
+    private val manager = appContext.getSystemService(CameraManager::class.java)
 
-    fun probeUsableLenses(): List<LensCapability> {
+    /** Metadata-only discovery. Useful for diagnostics; not sufficient for final UI filtering. */
+    fun probeUsableLenses(): List<LensCapability> =
+        assignUserFacingNames(selectMetadataPreferredCandidates(probeMetadataCandidates()))
+
+    /**
+     * Runtime-qualify all candidates on a worker thread.
+     *
+     * Physical members are preferred when at least one of them configures successfully.
+     * If every physical member of a logical camera is rejected, the logical stream is
+     * retained as an honest fallback when it can create a real preview session.
+     */
+    fun probeQualifiedLenses(
+        onProgress: ((completed: Int, total: Int, lens: LensCapability) -> Unit)? = null,
+    ): List<LensCapability> {
+        val candidates = probeMetadataCandidates()
+        if (candidates.isEmpty()) return emptyList()
+
+        val qualified = CameraSessionQualifier(appContext).use { qualifier ->
+            candidates.mapIndexed { index, lens ->
+                qualifier.qualify(lens).also {
+                    onProgress?.invoke(index + 1, candidates.size, it)
+                }
+            }
+        }
+
+        val preferred = qualified
+            .groupBy { it.logicalCameraId }
+            .values
+            .flatMap { group ->
+                val qualifiedPhysical = group.filter {
+                    it.physicalCameraId != null && it.userVisible
+                }
+                if (qualifiedPhysical.isNotEmpty()) {
+                    qualifiedPhysical
+                } else {
+                    group.filter { it.physicalCameraId == null && it.userVisible }
+                }
+            }
+            .distinctBy { it.stableId }
+
+        return assignUserFacingNames(preferred.map { it.copy(displayName = "Lens") })
+    }
+
+    private fun probeMetadataCandidates(): List<LensCapability> {
         val candidates = mutableListOf<LensCapability>()
 
         for (cameraId in manager.cameraIdList) {
@@ -30,26 +70,24 @@ class CameraCapabilityProbe(context: Context) {
                 .sorted()
 
             if (physicalIds.isNotEmpty()) {
-                val physicalCandidates = physicalIds.mapNotNull { physicalId ->
-                    val physicalChars = safeCharacteristics(physicalId) ?: return@mapNotNull null
+                physicalIds.mapNotNullTo(candidates) { physicalId ->
+                    val physicalChars = safeCharacteristics(physicalId) ?: return@mapNotNullTo null
                     buildCapability(
                         logicalCameraId = cameraId,
                         physicalCameraId = physicalId,
                         chars = physicalChars,
                         isLogicalMultiCamera = true,
                     )
-                }.filter { it.usableForPreview }
-
-                if (physicalCandidates.isNotEmpty()) {
-                    candidates += physicalCandidates
-                } else {
-                    buildCapability(
-                        logicalCameraId = cameraId,
-                        physicalCameraId = null,
-                        chars = logicalChars,
-                        isLogicalMultiCamera = true,
-                    )?.let(candidates::add)
                 }
+
+                // Always keep a logical fallback candidate for runtime qualification.
+                // It is hidden whenever one or more physical members qualify successfully.
+                buildCapability(
+                    logicalCameraId = cameraId,
+                    physicalCameraId = null,
+                    chars = logicalChars,
+                    isLogicalMultiCamera = true,
+                )?.let(candidates::add)
             } else {
                 buildCapability(
                     logicalCameraId = cameraId,
@@ -60,18 +98,18 @@ class CameraCapabilityProbe(context: Context) {
             }
         }
 
-        val deduped = candidates
+        return candidates
             .filter { it.usableForPreview }
-            .distinctBy { candidate ->
-                Triple(
-                    candidate.facing,
-                    candidate.physicalCameraId ?: candidate.logicalCameraId,
-                    candidate.focalLengthMm?.let { (it * 100f).toInt() },
-                )
-            }
-
-        return assignUserFacingNames(deduped)
+            .distinctBy { it.stableId }
     }
+
+    private fun selectMetadataPreferredCandidates(items: List<LensCapability>): List<LensCapability> =
+        items.groupBy { it.logicalCameraId }
+            .values
+            .flatMap { group ->
+                val physical = group.filter { it.physicalCameraId != null && it.usableForPreview }
+                if (physical.isNotEmpty()) physical else group.filter { it.physicalCameraId == null }
+            }
 
     private fun buildCapability(
         logicalCameraId: String,
@@ -151,5 +189,4 @@ class CameraCapabilityProbe(context: Context) {
 
     private fun safeCharacteristics(cameraId: String): CameraCharacteristics? =
         runCatching { manager.getCameraCharacteristics(cameraId) }.getOrNull()
-
 }

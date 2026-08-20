@@ -5,8 +5,8 @@ import android.content.pm.PackageManager
 import android.view.TextureView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -105,7 +105,7 @@ private fun PermissionScreen(onGrant: () -> Unit) {
             Text("Camera permission is required", color = Color.White, fontSize = 20.sp)
             Spacer(Modifier.height(16.dp))
             Text(
-                "The foundation build only opens framework-exposed camera devices. RAW capture and computational merging are implemented in later phases.",
+                "Phase 01 opens and validates real Camera2 sessions before a lens is shown.",
                 color = Color.LightGray,
             )
             Spacer(Modifier.height(24.dp))
@@ -119,7 +119,7 @@ private fun CameraScreen() {
     val context = LocalContext.current
     var lenses by remember { mutableStateOf<List<LensCapability>>(emptyList()) }
     var selectedLens by remember { mutableStateOf<LensCapability?>(null) }
-    var status by remember { mutableStateOf("Discovering usable lenses…") }
+    var status by remember { mutableStateOf("Qualifying Camera2 lens sessions…") }
     val nativeStatus = remember {
         runCatching {
             "Aurora ${AuroraNative.version()} • native self-test ${if (AuroraNative.selfTest()) "OK" else "FAILED"}"
@@ -128,11 +128,15 @@ private fun CameraScreen() {
 
     LaunchedEffect(Unit) {
         val result = withContext(Dispatchers.Default) {
-            CameraCapabilityProbe(context).probeUsableLenses()
+            CameraCapabilityProbe(context).probeQualifiedLenses()
         }
         lenses = result
         selectedLens = result.firstOrNull { !it.isFrontFacing } ?: result.firstOrNull()
-        status = if (result.isEmpty()) "No preview-capable cameras exposed by Camera2" else "${result.size} usable lens candidate(s)"
+        status = if (result.isEmpty()) {
+            "No runtime-qualified Camera2 lens sessions"
+        } else {
+            "${result.size} runtime-qualified lens(es)"
+        }
     }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
@@ -151,7 +155,7 @@ private fun CameraScreen() {
                 .background(Color(0x66000000))
                 .padding(horizontal = 16.dp, vertical = 14.dp),
         ) {
-            Text("Camera • Aurora foundation", color = Color.White, fontSize = 16.sp)
+            Text("Camera • Aurora Phase 01", color = Color.White, fontSize = 16.sp)
             Text(status, color = Color.LightGray, fontSize = 12.sp)
             Text(nativeStatus, color = Color.Gray, fontSize = 11.sp)
         }
@@ -177,7 +181,11 @@ private fun CameraScreen() {
                     .background(Color.White),
             )
             Spacer(Modifier.height(6.dp))
-            Text("Capture pipeline arrives after foundation qualification", color = Color.Gray, fontSize = 10.sp)
+            Text(
+                "Only runtime-qualified lenses are shown • shutter remains disabled in Phase 01",
+                color = Color.Gray,
+                fontSize = 10.sp,
+            )
         }
     }
 }
@@ -194,7 +202,7 @@ private fun LensSelector(
     ) {
         items(lenses, key = { it.stableId }) { lens ->
             val isSelected = selected?.stableId == lens.stableId
-            val maxRaw = lens.rawSizes.firstOrNull()
+            val qualifiedRaw = lens.qualification.qualifiedRawSize
             Column(
                 modifier = Modifier
                     .padding(horizontal = 5.dp)
@@ -208,12 +216,12 @@ private fun LensSelector(
                 Text(
                     buildString {
                         lens.focalLengthMm?.let { append(String.format("%.1fmm", it)) }
-                        if (lens.rawSupported) {
+                        if (lens.rawUsable) {
                             if (isNotEmpty()) append(" • ")
-                            append("RAW")
-                            maxRaw?.let { append(" ${it.width}×${it.height}") }
+                            append("RAW verified")
+                            qualifiedRaw?.let { append(" ${it.width}×${it.height}") }
                         }
-                    }.ifBlank { "Preview" },
+                    }.ifBlank { "Preview verified" },
                     color = if (isSelected) Color.DarkGray else Color.LightGray,
                     fontSize = 9.sp,
                 )
