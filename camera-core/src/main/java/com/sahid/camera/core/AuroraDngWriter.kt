@@ -24,7 +24,6 @@ import java.util.Locale
  */
 object AuroraDngWriter {
     private const val MIME_TYPE_DNG = "image/x-adobe-dng"
-    private const val RELATIVE_PATH = "DCIM/Camera"
 
     fun write(
         context: Context,
@@ -43,10 +42,11 @@ object AuroraDngWriter {
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
         val fileName = "IMG_${stamp}_AURORA.dng"
         val orientation = dngOrientation(characteristics)
+        val relativePath = CameraStoragePolicy.DNG_RELATIVE_PATH
 
         val displayFile = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            writeMediaStore(context, fileName, image, characteristics, captureResult, orientation)
-            File("/$RELATIVE_PATH", fileName)
+            writeMediaStore(context, fileName, relativePath, image, characteristics, captureResult, orientation)
+            File("/$relativePath", fileName)
         } else {
             writeLegacy(context, fileName, image, characteristics, captureResult, orientation)
         }
@@ -65,6 +65,7 @@ object AuroraDngWriter {
     private fun writeMediaStore(
         context: Context,
         fileName: String,
+        relativePath: String,
         image: Image,
         characteristics: CameraCharacteristics,
         captureResult: CaptureResult,
@@ -74,7 +75,7 @@ object AuroraDngWriter {
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
             put(MediaStore.Images.Media.MIME_TYPE, MIME_TYPE_DNG)
-            put(MediaStore.Images.Media.RELATIVE_PATH, RELATIVE_PATH)
+            put(MediaStore.Images.Media.RELATIVE_PATH, relativePath)
             put(MediaStore.Images.Media.DATE_TAKEN, System.currentTimeMillis())
             put(MediaStore.Images.Media.IS_PENDING, 1)
         }
@@ -128,15 +129,15 @@ object AuroraDngWriter {
     }
 
     /**
-     * The app is portrait-locked. Store the sensor-to-portrait rotation in TIFF orientation rather
-     * than rotating/re-sampling the Bayer mosaic.
+     * The app is portrait-locked. Keep the Bayer mosaic untouched and express display rotation in
+     * the DNG/TIFF orientation tag.
      */
     private fun dngOrientation(characteristics: CameraCharacteristics): Int {
         return when ((characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0) % 360) {
-            90 -> 6   // TIFF: rotate 90 CW for display
-            180 -> 3  // TIFF: rotate 180
-            270 -> 8  // TIFF: rotate 270 CW for display
-            else -> 1 // TIFF: normal
+            90 -> 6
+            180 -> 3
+            270 -> 8
+            else -> 1
         }
     }
 }
