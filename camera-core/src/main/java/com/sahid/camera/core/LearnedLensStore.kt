@@ -10,10 +10,10 @@ import org.json.JSONObject
 /**
  * Small per-build topology cache used only to make camera startup fast.
  *
- * Once a route has produced a usable preview/YUV result, remember it for this exact
- * Build.FINGERPRINT. A ROM/OTA fingerprint change invalidates it automatically. Fast startup can
- * therefore restore proven lenses without repeating session qualification or hidden-ID scanning.
- * Logical->physical topology is persisted as well so lens families remain stable after restart.
+ * Once a route has produced a usable preview/YUV result, remember that exact access profile for this
+ * Build.FINGERPRINT. A ROM/OTA fingerprint change invalidates it automatically. Multiple proven
+ * profiles for the same physical target are intentionally retained; [LensFamilyResolver] chooses the
+ * user-facing default while alternate profiles stay available for compatibility/fallback.
  */
 class LearnedLensStore(context: Context) {
     private val appContext = context.applicationContext
@@ -44,17 +44,30 @@ class LearnedLensStore(context: Context) {
             ?: Snapshot(deepScanCompleted = false, routes = emptyList())
     }
 
+    /**
+     * A deep scan may prove alternate profiles as well as selector defaults. Preserve every proven
+     * stable route instead of replacing the cache with only the current UI-visible family defaults.
+     */
     fun saveDeepScan(report: CameraQualificationReport) {
-        saveRoutes(report.visibleLenses, deepScanCompleted = true)
+        val current = load()
+        val provenFromReport = report.candidates.filter {
+            it.userVisible && it.qualification.accessPathOpenQualified
+        }
+        val merged = (current.routes + provenFromReport)
+            .filter { it.userVisible }
+            .groupBy { it.stableId }
+            .values
+            .mapNotNull { sameProfile -> sameProfile.minByOrNull(::legacyRouteScore) }
+        saveRoutes(merged, deepScanCompleted = true)
     }
 
     fun mergeProvenRoutes(routes: List<LensCapability>) {
         val current = load()
         val merged = (current.routes + routes)
             .filter { it.userVisible }
-            .groupBy { it.cameraId }
+            .groupBy { it.stableId }
             .values
-            .mapNotNull { candidates -> candidates.minByOrNull(::legacyRouteScore) }
+            .mapNotNull { sameProfile -> sameProfile.minByOrNull(::legacyRouteScore) }
         saveRoutes(merged, deepScanCompleted = current.deepScanCompleted)
     }
 
@@ -84,7 +97,8 @@ class LearnedLensStore(context: Context) {
 
     private fun saveRoutes(routes: List<LensCapability>, deepScanCompleted: Boolean) {
         val payload = JSONObject()
-            .put("schemaVersion", 2)
+            .put("schemaVersion", 3)
+            .put("classifierVersion", LensFamilyPolicy.CLASSIFIER_VERSION)
             .put("buildFingerprint", Build.FINGERPRINT)
             .put("sdkInt", Build.VERSION.SDK_INT)
             .put("deepScanCompleted", deepScanCompleted)
@@ -107,7 +121,7 @@ class LearnedLensStore(context: Context) {
                     legacyCandidate(item)?.let(::add)
                 }
             }
-                .groupBy { it.cameraId }
+                .groupBy { it.stableId }
                 .values
                 .mapNotNull { paths -> paths.minByOrNull(::legacyRouteScore) }
         }.getOrNull() ?: return null
