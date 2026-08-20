@@ -13,6 +13,7 @@ enum class CameraDiscoverySource {
     JAVA_DIRECT,
     NDK_DIRECT,
     LOGICAL_PHYSICAL,
+    HIDDEN_ID_PROBE,
 }
 
 data class LensCapability(
