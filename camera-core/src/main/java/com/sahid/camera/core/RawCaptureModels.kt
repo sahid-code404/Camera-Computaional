@@ -43,6 +43,7 @@ data class RawImagePacket(
 
 data class RawCaptureRecord(
     val file: File,
+    val previewFile: File? = null,
     val cameraId: String,
     val accessPath: CameraAccessPath,
     val width: Int,
