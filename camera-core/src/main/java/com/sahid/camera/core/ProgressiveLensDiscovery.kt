@@ -18,13 +18,8 @@ import kotlin.math.atan
  *
  * This pass runs after the primary preview has already started. It never opens a camera and never
  * configures a capture session. Java/NDK advertised metadata plus the bounded native numeric
- * metadata view are merged into transient lens candidates. Selecting a candidate performs the real
- * open/session/frame test in CameraPreviewController; only a real frame is written to the learned
- * route cache.
- *
- * Metadata-valid helper/logical aliases are not automatically useful lenses. Before publishing the
- * selector map, [LensValueFilter] collapses only strongly proven optical duplicates and prefers an
- * already frame-proven/public route. Distinct FOVs remain visible.
+ * metadata view are merged into route profiles. [LensFamilyResolver] then exposes one default route
+ * per physical lens family while [CandidateLensStore] retains every alias/profile internally.
  */
 class ProgressiveLensDiscovery(context: Context) {
     private val appContext = context.applicationContext
@@ -57,51 +52,47 @@ class ProgressiveLensDiscovery(context: Context) {
             )?.let(candidates::add)
         }
 
-        // NDK-advertised cameras that Java did not advertise remain valid automatic candidates.
         ndkAdvertised.forEach { native ->
             if (native.id !in javaSet) nativeCandidate(native, hidden = false)?.let(candidates::add)
         }
 
-        // Metadata-valid numeric IDs can include OEM auxiliary cameras omitted from both public ID
-        // lists. This stage is cheap because it does not call openCamera().
         autoNative.forEach autoLoop@ { info ->
             if (info.id in javaSet || info.id in ndkAdvertisedSet) return@autoLoop
             autoNativeCandidate(info)?.let(candidates::add)
         }
 
-        // Java logical/physical topology is metadata-only. A child is exposed only when its own
-        // characteristics contain a renderable stream configuration.
+        // Java logical/physical topology is metadata-only. A child becomes another access profile
+        // for the child's family, never another user-facing lens when the child also has a direct
+        // route.
         javaChars.forEach { (logicalId, logicalChars) ->
             logicalChars.physicalCameraIds.forEach physicalLoop@ { physicalId ->
-                if (candidates.any { it.cameraId == physicalId }) return@physicalLoop
                 val childChars = runCatching { manager.getCameraCharacteristics(physicalId) }.getOrNull()
                     ?: return@physicalLoop
                 javaPhysicalCandidate(logicalId, physicalId, childChars)?.let(candidates::add)
             }
         }
 
+        // Keep a preferred metadata route per exact endpoint for the automatic selector. Alternate
+        // access routes for the same camera ID are still retained when they are frame-proven by the
+        // learned store or discovered through explicit physical routing above.
         val preferredMetadataRoutes = candidates
             .filter { it.userVisible }
             .groupBy { it.cameraId }
             .values
             .mapNotNull { routes -> routes.minByOrNull(::routeScore) }
 
-        // Include existing frame-proven routes as optical anchors. This is what prevents a helper
-        // alias such as another main-camera endpoint from reappearing beside the already proven
-        // main lens while still preserving truly different ultrawide/tele/macro FOVs.
         val learnedRoutes = learnedStore.load().routes.filter { it.userVisible }
-        val selectorRoutes = LensValueFilter.filterForSelector(
-            learnedRoutes + preferredMetadataRoutes
-        )
-
-        // Remember useful-but-unproven candidates separately. They reappear instantly after a
-        // restart but remain visibly distinct from LEARNED routes until a real frame is received.
         val learnedIds = learnedRoutes.mapTo(mutableSetOf()) { it.cameraId }
+
+        // Persist ALL unproven endpoint profiles before family collapsing. This is the critical
+        // difference from the old dedup cache: aliases survive restart and remain available for
+        // fallback/debug even though the normal selector shows only each family's default route.
         candidateStore.replace(
-            selectorRoutes.filter { route -> route.cameraId !in learnedIds }
+            preferredMetadataRoutes.filter { route -> route.cameraId !in learnedIds },
+            autoScanCompleted = true,
         )
 
-        return selectorRoutes.map { it.copy(displayName = "ID ${it.cameraId}") }
+        return LensFamilyResolver.defaultsForSelector(learnedRoutes + preferredMetadataRoutes)
     }
 
     private fun javaCandidate(
@@ -120,6 +111,7 @@ class ProgressiveLensDiscovery(context: Context) {
             if (alsoNdk) add(CameraDiscoverySource.NDK_DIRECT)
         },
         logical = chars.physicalCameraIds.isNotEmpty(),
+        logicalPhysicalIds = chars.physicalCameraIds,
     )
 
     private fun javaPhysicalCandidate(
@@ -136,7 +128,8 @@ class ProgressiveLensDiscovery(context: Context) {
             CameraDiscoverySource.LOGICAL_PHYSICAL,
             CameraDiscoverySource.AUTO_METADATA,
         ),
-        logical = true,
+        logical = chars.physicalCameraIds.isNotEmpty(),
+        logicalPhysicalIds = emptySet(),
     )
 
     private fun javaCapability(
@@ -147,6 +140,7 @@ class ProgressiveLensDiscovery(context: Context) {
         accessPath: CameraAccessPath,
         sources: Set<CameraDiscoverySource>,
         logical: Boolean,
+        logicalPhysicalIds: Set<String>,
     ): LensCapability? {
         val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return null
         val preview = map.getOutputSizes(SurfaceTexture::class.java)
@@ -180,6 +174,7 @@ class ProgressiveLensDiscovery(context: Context) {
             burstCapture = CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_BURST_CAPTURE in capabilities,
             maxResolutionSensor = CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_ULTRA_HIGH_RESOLUTION_SENSOR in capabilities,
             isLogicalMultiCamera = logical,
+            logicalPhysicalIds = logicalPhysicalIds,
             usableForPreview = true,
             qualification = optimisticQualification(preview, yuv),
         )
@@ -213,6 +208,7 @@ class ProgressiveLensDiscovery(context: Context) {
             burstCapture = false,
             maxResolutionSensor = false,
             isLogicalMultiCamera = native.logicalMultiCamera,
+            logicalPhysicalIds = native.physicalIds.toSet(),
             usableForPreview = true,
             nativeHardwareLevel = native.hardwareLevel,
             nativeCharacteristicsStatus = native.characteristicsStatus,
@@ -248,6 +244,7 @@ class ProgressiveLensDiscovery(context: Context) {
             burstCapture = false,
             maxResolutionSensor = false,
             isLogicalMultiCamera = info.logicalMultiCamera,
+            logicalPhysicalIds = info.physicalIds.toSet(),
             usableForPreview = true,
             qualification = optimisticQualification(preview, yuv),
         )
@@ -259,7 +256,7 @@ class ProgressiveLensDiscovery(context: Context) {
         yuvSessionQualified = preview.isEmpty() && yuv.isNotEmpty(),
         rawSessionQualified = false,
         qualifiedRawSize = null,
-        detail = "Automatic metadata candidate; first live frame proves route",
+        detail = "Automatic metadata profile; first live frame proves route",
     )
 
     private fun horizontalFov(sensorWidthMm: Float?, focalMm: Float?): Float? {
