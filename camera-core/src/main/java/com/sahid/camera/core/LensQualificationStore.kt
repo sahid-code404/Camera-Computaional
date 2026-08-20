@@ -19,16 +19,17 @@ class LensQualificationStore(context: Context) {
 
     fun save(report: CameraQualificationReport) {
         val payload = JSONObject()
-            .put("schemaVersion", 3)
+            .put("schemaVersion", 4)
             .put("buildFingerprint", Build.FINGERPRINT)
             .put("sdkInt", Build.VERSION.SDK_INT)
             .put("javaDirectIds", JSONArray(report.discovery.javaDirectIds))
             .put("ndkDirectIds", JSONArray(report.discovery.ndkDirectIds))
-            .put("logicalTopology", JSONObject().apply {
-                report.discovery.logicalTopology.forEach { (logicalId, physicalIds) ->
-                    put(logicalId, JSONArray(physicalIds))
-                }
-            })
+            .put("logicalTopology", topologyJson(report.discovery.logicalTopology))
+            .put("hiddenProbeMaxNumericId", report.discovery.hiddenProbeMaxNumericId)
+            .put("hiddenProbeAttemptedCount", report.discovery.hiddenProbeAttemptedCount)
+            .put("hiddenMetadataIds", JSONArray(report.discovery.hiddenMetadataIds))
+            .put("hiddenDiscoveredIds", JSONArray(report.discovery.hiddenDiscoveredIds))
+            .put("hiddenLogicalTopology", topologyJson(report.discovery.hiddenLogicalTopology))
             .put("candidates", JSONArray().apply {
                 report.candidates.forEach { lens ->
                     put(JSONObject().apply {
@@ -60,7 +61,13 @@ class LensQualificationStore(context: Context) {
 
     fun loadCurrentBuildJson(): String? = prefs.getString(Build.FINGERPRINT, null)
 
+    private fun topologyJson(topology: Map<String, List<String>>): JSONObject = JSONObject().apply {
+        topology.forEach { (logicalId, physicalIds) ->
+            put(logicalId, JSONArray(physicalIds))
+        }
+    }
+
     private companion object {
-        const val PREFS_NAME = "camera_phase01_qualification_v3"
+        const val PREFS_NAME = "camera_phase01_qualification_v4"
     }
 }
