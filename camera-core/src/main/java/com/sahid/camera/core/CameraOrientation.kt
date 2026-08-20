@@ -5,7 +5,7 @@ import android.view.Surface
 
 /** Shared Camera2 orientation math. */
 object CameraOrientation {
-    fun displayDegrees(displayRotation: Int): Int = when (displayRotation) {
+    fun surfaceRotationConstantToDegrees(rotation: Int): Int = when (rotation) {
         Surface.ROTATION_90 -> 90
         Surface.ROTATION_180 -> 180
         Surface.ROTATION_270 -> 270
@@ -13,30 +13,29 @@ object CameraOrientation {
     }
 
     /**
-     * Rotation used by Android's Camera2 preview transform. Camera SurfaceTexture output is already
-     * expressed in the device's native orientation, so this compensates only the display rotation.
+     * TextureView already accounts for sensor orientation. This is the remaining device-rotation
+     * compensation used by the Camera2 reference preview transform.
      */
-    fun surfacePreviewRotationDegrees(isFrontFacing: Boolean, displayRotation: Int): Int {
-        val deviceDegrees = displayDegrees(displayRotation)
-        return if (isFrontFacing) {
-            (360 + deviceDegrees) % 360
-        } else {
-            (360 - deviceDegrees) % 360
-        }
+    fun surfacePreviewRotationDegrees(
+        isFrontFacing: Boolean,
+        surfaceRotationDegrees: Int,
+    ): Int = if (isFrontFacing) {
+        (360 + surfaceRotationDegrees) % 360
+    } else {
+        (360 - surfaceRotationDegrees) % 360
     }
 
     /**
-     * Rotation from RAW sensor coordinates to the current device/display orientation. This follows
-     * the Camera2 reference sample's sensorToDeviceRotation formula.
+     * Camera2 relative-rotation formula from Android's camera orientation guidance.
+     * surfaceRotationDegrees uses the counter-clockwise Surface/Display convention.
      */
     fun sensorToDeviceDegrees(
         sensorOrientation: Int,
         isFrontFacing: Boolean,
-        displayRotation: Int,
+        surfaceRotationDegrees: Int,
     ): Int {
-        var deviceDegrees = displayDegrees(displayRotation)
-        if (isFrontFacing) deviceDegrees = -deviceDegrees
-        return (sensorOrientation + deviceDegrees + 360) % 360
+        val sign = if (isFrontFacing) 1 else -1
+        return (sensorOrientation - surfaceRotationDegrees * sign + 360) % 360
     }
 
     fun exifOrientationForDegrees(degrees: Int): Int = when ((degrees % 360 + 360) % 360) {
