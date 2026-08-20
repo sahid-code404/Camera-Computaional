@@ -22,6 +22,7 @@ kotlin {
 }
 
 dependencies {
+    implementation(project(":aurora-core"))
     implementation(libs.androidx.core.ktx)
     testImplementation(libs.junit)
 }
