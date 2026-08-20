@@ -19,7 +19,7 @@ class LensQualificationStore(context: Context) {
 
     fun save(report: CameraQualificationReport) {
         val payload = JSONObject()
-            .put("schemaVersion", 2)
+            .put("schemaVersion", 3)
             .put("buildFingerprint", Build.FINGERPRINT)
             .put("sdkInt", Build.VERSION.SDK_INT)
             .put("javaDirectIds", JSONArray(report.discovery.javaDirectIds))
@@ -38,11 +38,16 @@ class LensQualificationStore(context: Context) {
                         put("physicalCameraId", lens.physicalCameraId ?: JSONObject.NULL)
                         put("accessPath", lens.accessPath.name)
                         put("discoverySources", JSONArray(lens.discoverySources.map { it.name }))
+                        put("focalLengthMm", lens.focalLengthMm ?: JSONObject.NULL)
+                        put("sensorWidthMm", lens.sensorWidthMm ?: JSONObject.NULL)
+                        put("sensorHeightMm", lens.sensorHeightMm ?: JSONObject.NULL)
+                        put("horizontalFovDegrees", lens.horizontalFovDegrees ?: JSONObject.NULL)
                         put("openQualified", lens.qualification.accessPathOpenQualified)
                         put("previewQualified", lens.qualification.previewSessionQualified)
                         put("yuvQualified", lens.qualification.yuvSessionQualified)
                         put("rawAdvertised", lens.rawSupported)
                         put("rawQualified", lens.qualification.rawSessionQualified)
+                        put("userVisible", lens.userVisible)
                         put("qualificationDetail", lens.qualification.detail)
                     })
                 }
@@ -56,6 +61,6 @@ class LensQualificationStore(context: Context) {
     fun loadCurrentBuildJson(): String? = prefs.getString(Build.FINGERPRINT, null)
 
     private companion object {
-        const val PREFS_NAME = "camera_phase01_qualification_v2"
+        const val PREFS_NAME = "camera_phase01_qualification_v3"
     }
 }
