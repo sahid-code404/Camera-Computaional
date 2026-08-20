@@ -1,6 +1,7 @@
 package com.sahid.camera.core
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -64,7 +65,7 @@ class LensValueFilterTest {
     }
 
     @Test
-    fun directLogicalParentIsNotMistakenForItsPhysicalChild() {
+    fun directLogicalControlEndpointIsRetainedInternallyButHiddenFromSelector() {
         val child = lens(
             id = "20",
             learned = true,
@@ -76,7 +77,7 @@ class LensValueFilterTest {
         )
         val directLogical = lens(
             id = "61",
-            learned = true,
+            learned = false,
             focal = 4.7f,
             sensorWidth = 5.6f,
             sensorHeight = 4.2f,
@@ -87,10 +88,12 @@ class LensValueFilterTest {
         )
 
         val families = LensFamilyResolver.resolve(listOf(directLogical, child))
+        val selector = LensFamilyResolver.defaultsForSelector(listOf(directLogical, child))
 
         assertEquals(2, families.size)
-        assertTrue(families.any { it.defaultRoute.cameraId == "20" })
-        assertTrue(families.any { it.defaultRoute.cameraId == "61" })
+        assertTrue(families.any { it.familyId == "61" })
+        assertFalse(families.first { it.familyId == "61" }.selectorVisible)
+        assertEquals(listOf("20"), selector.map { it.cameraId })
     }
 
     @Test
