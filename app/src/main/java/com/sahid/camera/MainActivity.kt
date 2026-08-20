@@ -60,6 +60,7 @@ import com.sahid.camera.core.LensCapability
 import com.sahid.camera.core.LensValueFilter
 import com.sahid.camera.core.ProgressiveLensDiscovery
 import com.sahid.camera.core.RawCaptureOutcome
+import com.sahid.camera.core.RawRouteResolver
 import com.sahid.camera.core.SingleRawCaptureEngine
 import com.sahid.camera.ui.CameraTheme
 import com.sahid.camera.update.OtaCheckResult
@@ -134,6 +135,7 @@ private fun PermissionScreen(onGrant: () -> Unit) {
 private fun CameraScreen() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val rawRouteResolver = remember { RawRouteResolver(context) }
 
     val bootstrap = remember { InstantLensBootstrap.load(context) }
     var lenses by remember { mutableStateOf(bootstrap.lenses) }
@@ -356,8 +358,9 @@ private fun CameraScreen() {
             }
             Spacer(Modifier.height(10.dp))
 
-            val shutterLens = selectedLens
-            val rawAvailable = shutterLens?.let { it.rawSupported && it.rawSizes.isNotEmpty() } == true
+            val familyLens = selectedLens
+            val rawRoute = familyLens?.let(rawRouteResolver::resolve)
+            val rawAvailable = rawRoute != null
             Box(
                 modifier = Modifier
                     .size(76.dp)
@@ -366,17 +369,20 @@ private fun CameraScreen() {
                     .clip(CircleShape)
                     .background(if (rawAvailable && !rawCaptureBusy) Color.White else Color.DarkGray)
                     .clickable(enabled = rawAvailable && !rawCaptureBusy) {
-                        val captureLens = selectedLens ?: return@clickable
+                        val selectedFamilyLens = selectedLens ?: return@clickable
+                        val captureRoute = rawRoute ?: return@clickable
                         scope.launch {
                             rawCaptureBusy = true
                             selectedLens = null
-                            status = "Capturing canonical RAW_SENSOR…"
+                            status = if (captureRoute.stableId == selectedFamilyLens.stableId) {
+                                "Capturing canonical RAW_SENSOR…"
+                            } else {
+                                "Capturing RAW via ${captureRoute.accessPath.name} family profile…"
+                            }
                             try {
-                                // CameraPreviewController closes synchronously on disposal; this tiny grace
-                                // period lets vendor CameraService finish the device-close transition.
                                 delay(RAW_PREVIEW_RELEASE_DELAY_MS)
                                 when (val outcome = withContext(Dispatchers.IO) {
-                                    SingleRawCaptureEngine(context).capture(captureLens)
+                                    SingleRawCaptureEngine(context).capture(captureRoute)
                                 }) {
                                     is RawCaptureOutcome.Success -> {
                                         val record = outcome.record
@@ -386,9 +392,9 @@ private fun CameraScreen() {
                                     is RawCaptureOutcome.Failure -> status = "RAW failed • ${outcome.reason}"
                                 }
                             } finally {
-                                selectedLens = lenses.firstOrNull { it.stableId == captureLens.stableId }
-                                    ?: lenses.firstOrNull { it.cameraId == captureLens.cameraId }
-                                    ?: captureLens
+                                selectedLens = lenses.firstOrNull { it.stableId == selectedFamilyLens.stableId }
+                                    ?: lenses.firstOrNull { it.cameraId == selectedFamilyLens.cameraId }
+                                    ?: selectedFamilyLens
                                 rawCaptureBusy = false
                             }
                         }
@@ -398,11 +404,13 @@ private fun CameraScreen() {
             Text(
                 when {
                     rawCaptureBusy -> "RAW_SENSOR capture • pairing image + sensor metadata…"
+                    rawAvailable && rawRoute?.stableId != familyLens?.stableId ->
+                        "Phase 02A • RAW available through internal family profile"
                     rawAvailable -> "Phase 02A • canonical RAW_SENSOR ready"
                     autoDiscoveryBusy -> "Preview live • finding useful extra lenses in background…"
                     bootstrap.backgroundDiscoveryNeeded && !autoDiscoveryStarted ->
                         "Preview first • lens discovery waits for first real frame"
-                    else -> "RAW unavailable on selected lens"
+                    else -> "RAW unavailable on selected lens family"
                 },
                 color = Color.Gray,
                 fontSize = 10.sp,
