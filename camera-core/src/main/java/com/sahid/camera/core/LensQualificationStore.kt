@@ -19,9 +19,10 @@ class LensQualificationStore(context: Context) {
 
     fun save(report: CameraQualificationReport) {
         val payload = JSONObject()
-            .put("schemaVersion", 4)
+            .put("schemaVersion", 5)
             .put("buildFingerprint", Build.FINGERPRINT)
             .put("sdkInt", Build.VERSION.SDK_INT)
+            .put("cameraLabMode", report.discovery.cameraLabMode)
             .put("javaDirectIds", JSONArray(report.discovery.javaDirectIds))
             .put("ndkDirectIds", JSONArray(report.discovery.ndkDirectIds))
             .put("logicalTopology", topologyJson(report.discovery.logicalTopology))
@@ -30,6 +31,10 @@ class LensQualificationStore(context: Context) {
             .put("hiddenMetadataIds", JSONArray(report.discovery.hiddenMetadataIds))
             .put("hiddenDiscoveredIds", JSONArray(report.discovery.hiddenDiscoveredIds))
             .put("hiddenLogicalTopology", topologyJson(report.discovery.hiddenLogicalTopology))
+            .put("deepJavaMetadataIds", JSONArray(report.discovery.deepJavaMetadataIds))
+            .put("deepJavaOpenSucceededIds", JSONArray(report.discovery.deepJavaOpenSucceededIds))
+            .put("deepNdkOpenSucceededIds", JSONArray(report.discovery.deepNdkOpenSucceededIds))
+            .put("deepOpenDiscoveredIds", JSONArray(report.discovery.deepOpenDiscoveredIds))
             .put("candidates", JSONArray().apply {
                 report.candidates.forEach { lens ->
                     put(JSONObject().apply {
@@ -39,6 +44,7 @@ class LensQualificationStore(context: Context) {
                         put("physicalCameraId", lens.physicalCameraId ?: JSONObject.NULL)
                         put("accessPath", lens.accessPath.name)
                         put("discoverySources", JSONArray(lens.discoverySources.map { it.name }))
+                        put("deepOpenDiscovered", lens.deepOpenDiscovered)
                         put("focalLengthMm", lens.focalLengthMm ?: JSONObject.NULL)
                         put("sensorWidthMm", lens.sensorWidthMm ?: JSONObject.NULL)
                         put("sensorHeightMm", lens.sensorHeightMm ?: JSONObject.NULL)
@@ -68,6 +74,6 @@ class LensQualificationStore(context: Context) {
     }
 
     private companion object {
-        const val PREFS_NAME = "camera_phase01_qualification_v4"
+        const val PREFS_NAME = "camera_phase01_qualification_v5"
     }
 }
