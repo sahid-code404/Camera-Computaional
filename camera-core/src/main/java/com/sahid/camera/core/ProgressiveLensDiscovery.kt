@@ -60,8 +60,11 @@ class ProgressiveLensDiscovery(context: Context) {
             )?.let(candidates::add)
         }
 
+        // Keep the native route even when the same camera ID is also Java-advertised. One physical
+        // lens can legitimately have multiple access profiles, and the family default can then use
+        // whichever route has real-frame evidence while retaining the other as a fallback.
         ndkAdvertised.forEach { native ->
-            if (native.id !in javaSet) nativeCandidate(native, hidden = false)?.let(candidates::add)
+            nativeCandidate(native, hidden = native.id !in javaSet)?.let(candidates::add)
         }
 
         autoNative.forEach autoLoop@ { info ->
@@ -69,9 +72,8 @@ class ProgressiveLensDiscovery(context: Context) {
             autoNativeCandidate(info)?.let(candidates::add)
         }
 
-        // Java logical/physical topology is metadata-only. A child becomes another access profile
-        // for the child's family, never another user-facing lens when the child also has a direct
-        // route.
+        // Java logical/physical topology contributes another profile for the physical child's
+        // family. It is retained even when a direct child route also exists.
         javaChars.forEach { (logicalId, logicalChars) ->
             logicalChars.physicalCameraIds.forEach physicalLoop@ { physicalId ->
                 val childChars = runCatching { manager.getCameraCharacteristics(physicalId) }.getOrNull()
@@ -80,27 +82,24 @@ class ProgressiveLensDiscovery(context: Context) {
             }
         }
 
-        // Keep a preferred metadata route per exact endpoint for the automatic selector. Alternate
-        // access routes for the same camera ID are still retained when they are frame-proven by the
-        // learned store or discovered through explicit physical routing above.
-        val preferredMetadataRoutes = candidates
+        val metadataRoutes = candidates
             .filter { it.userVisible }
-            .groupBy { it.cameraId }
+            .groupBy { it.stableId }
             .values
-            .mapNotNull { routes -> routes.minByOrNull(::routeScore) }
+            .mapNotNull { sameProfile -> sameProfile.firstOrNull() }
 
         val learnedRoutes = cachedLearned
-        val learnedIds = learnedRoutes.mapTo(mutableSetOf()) { it.cameraId }
+        val learnedStableIds = learnedRoutes.mapTo(mutableSetOf()) { it.stableId }
 
-        // Persist ALL unproven endpoint profiles before family collapsing. This is the critical
-        // difference from the old dedup cache: aliases survive restart and remain available for
-        // fallback/debug even though the normal selector shows only each family's default route.
+        // Persist ALL unproven profiles before family collapsing. This is the critical difference
+        // from the old dedup cache: aliases survive restart and remain available for fallback/debug
+        // even though the normal selector shows only each family's default route.
         candidateStore.replace(
-            preferredMetadataRoutes.filter { route -> route.cameraId !in learnedIds },
+            metadataRoutes.filter { route -> route.stableId !in learnedStableIds },
             autoScanCompleted = true,
         )
 
-        return LensFamilyResolver.defaultsForSelector(learnedRoutes + preferredMetadataRoutes)
+        return LensFamilyResolver.defaultsForSelector(learnedRoutes + metadataRoutes)
     }
 
     private fun javaCandidate(
@@ -270,12 +269,6 @@ class ProgressiveLensDiscovery(context: Context) {
     private fun horizontalFov(sensorWidthMm: Float?, focalMm: Float?): Float? {
         if (sensorWidthMm == null || focalMm == null || sensorWidthMm <= 0f || focalMm <= 0f) return null
         return (2.0 * atan(sensorWidthMm / (2.0 * focalMm)) * 180.0 / PI).toFloat()
-    }
-
-    private fun routeScore(lens: LensCapability): Int = when (lens.accessPath) {
-        CameraAccessPath.JAVA_DIRECT -> 0
-        CameraAccessPath.NDK_DIRECT -> 10
-        CameraAccessPath.PHYSICAL_VIA_LOGICAL -> 20
     }
 
     private fun area(size: Size): Long = size.width.toLong() * size.height.toLong()
