@@ -46,6 +46,12 @@ data class LensCapability(
     val burstCapture: Boolean,
     val maxResolutionSensor: Boolean,
     val isLogicalMultiCamera: Boolean,
+    /**
+     * Physical children explicitly reported by this logical camera endpoint. Keeping this on the
+     * route lets the selector build MotionCam-style lens families after a restart without having
+     * to enumerate Camera2 again.
+     */
+    val logicalPhysicalIds: Set<String> = emptySet(),
     /** Metadata hint only. It is never sufficient to persist a learned route. */
     val usableForPreview: Boolean,
     val nativeHardwareLevel: Int? = null,
