@@ -54,7 +54,7 @@ import com.sahid.camera.core.CameraCapabilityProbe
 import com.sahid.camera.core.CameraDiagnostics
 import com.sahid.camera.core.CameraDiscoverySource
 import com.sahid.camera.core.CameraPreviewController
-import com.sahid.camera.core.CameraQualificationReport
+import com.sahid.camera.core.InstantLensBootstrap
 import com.sahid.camera.core.LensCapability
 import com.sahid.camera.ui.CameraTheme
 import com.sahid.camera.update.OtaCheckResult
@@ -115,7 +115,7 @@ private fun PermissionScreen(onGrant: () -> Unit) {
             Text("Camera permission is required", color = Color.White, fontSize = 20.sp)
             Spacer(Modifier.height(16.dp))
             Text(
-                "Camera starts from learned + advertised lens routes. Hidden-ID deep discovery runs only when you request it.",
+                "Camera opens learned lenses immediately. Deep hidden-lens discovery runs only when you request it.",
                 color = Color.LightGray,
             )
             Spacer(Modifier.height(24.dp))
@@ -128,10 +128,29 @@ private fun PermissionScreen(onGrant: () -> Unit) {
 private fun CameraScreen() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var lenses by remember { mutableStateOf<List<LensCapability>>(emptyList()) }
-    var selectedLens by remember { mutableStateOf<LensCapability?>(null) }
+
+    // This is deliberately synchronous and tiny. With a learned map it only parses one small
+    // SharedPreferences record: no CameraManager enumeration, NDK enumeration or qualification.
+    val bootstrap = remember { InstantLensBootstrap.load(context) }
+    var lenses by remember { mutableStateOf(bootstrap.lenses) }
+    var selectedLens by remember {
+        mutableStateOf(
+            bootstrap.lenses.firstOrNull { !it.isFrontFacing }
+                ?: bootstrap.lenses.firstOrNull()
+        )
+    }
     var diagnosticsJson by remember { mutableStateOf<String?>(null) }
-    var status by remember { mutableStateOf("Loading learned lens map…") }
+    var status by remember {
+        mutableStateOf(
+            when {
+                bootstrap.learned && bootstrap.lenses.isNotEmpty() ->
+                    "Instant lens map • ${bootstrap.lenses.size} cached"
+                bootstrap.lenses.isNotEmpty() ->
+                    "Opening public camera • live frame will learn route"
+                else -> "No public camera route • tap Find lenses"
+            }
+        )
+    }
     var lensScanBusy by remember { mutableStateOf(false) }
     var otaResult by remember { mutableStateOf<OtaCheckResult?>(null) }
     var otaBusy by remember { mutableStateOf(false) }
@@ -142,40 +161,7 @@ private fun CameraScreen() {
         }.getOrElse { "Aurora native core unavailable" }
     }
 
-    fun applyReport(report: CameraQualificationReport, prefix: String) {
-        lenses = report.visibleLenses
-        val currentId = selectedLens?.cameraId
-        selectedLens = currentId?.let { id -> report.visibleLenses.firstOrNull { it.cameraId == id } }
-            ?: report.visibleLenses.firstOrNull { !it.isFrontFacing }
-            ?: report.visibleLenses.firstOrNull()
-        diagnosticsJson = CameraDiagnostics.toJson(report)
-        status = buildString {
-            append(prefix)
-            append(" • Java ")
-            append(report.discovery.javaDirectIds.size)
-            append(" • NDK ")
-            append(report.discovery.ndkDirectIds.size)
-            append(" • hidden ")
-            append(report.discovery.hiddenDiscoveredIds.size)
-            append(" • lenses ")
-            append(report.visibleLenses.size)
-            val learned = report.visibleLenses.count {
-                CameraDiscoverySource.LEARNED_CACHE in it.discoverySources
-            }
-            if (learned > 0) {
-                append(" • learned ")
-                append(learned)
-            }
-        }
-    }
-
-    LaunchedEffect(Unit) {
-        val report = withContext(Dispatchers.Default) {
-            CameraCapabilityProbe(context).probeFastQualificationReport()
-        }
-        applyReport(report, "Fast startup")
-    }
-
+    // OTA/network work is independent of camera startup and never triggers camera discovery.
     LaunchedEffect(Unit) {
         otaBusy = true
         otaResult = OtaUpdateManager.checkForUpdate().also { result ->
@@ -239,10 +225,10 @@ private fun CameraScreen() {
                         scope.launch {
                             lensScanBusy = true
                             val previousId = selectedLens?.cameraId
-                            // Release the active preview before deep camera opens so OEM camera
-                            // resource arbitration cannot create false negatives.
+                            // Deep probing is the ONLY operation that intentionally releases preview
+                            // and searches compatibility IDs. Normal app startup never reaches it.
                             selectedLens = null
-                            status = "Deep hidden-lens scan… this runs only on demand"
+                            status = "Finding hidden lenses…"
                             val report = withContext(Dispatchers.Default) {
                                 CameraCapabilityProbe(context).probeDeepQualificationReport()
                             }
@@ -252,7 +238,7 @@ private fun CameraScreen() {
                             } ?: report.visibleLenses.firstOrNull { !it.isFrontFacing }
                                 ?: report.visibleLenses.firstOrNull()
                             diagnosticsJson = CameraDiagnostics.toJson(report)
-                            status = "Lens map learned • ${report.visibleLenses.size} working cameras cached for this ROM"
+                            status = "Lens map learned • ${report.visibleLenses.size} working cameras cached"
                             lensScanBusy = false
                         }
                     },
@@ -319,7 +305,7 @@ private fun CameraScreen() {
             )
             Spacer(Modifier.height(6.dp))
             Text(
-                "Normal launch: learned + advertised routes only • Find lenses: deep hidden scan + real-frame cache",
+                "Hot launch: cache only • no Java/NDK enumeration • Find lenses performs compatibility scan",
                 color = Color.Gray,
                 fontSize = 10.sp,
             )
