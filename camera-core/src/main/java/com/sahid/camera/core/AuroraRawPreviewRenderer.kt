@@ -19,7 +19,11 @@ import kotlin.math.pow
  *
  * This renderer NEVER replaces or mutates the canonical AURAW record. It consumes the exact
  * RAW_SENSOR packet already destined for AURAW and produces a lightweight JPEG sidecar only so
- * users can inspect what was captured in ordinary Gallery/Files applications.
+ * users can inspect what was captured in ordinary Gallery/Photos applications.
+ *
+ * The derived JPEG is published to the conventional DCIM/Camera album. It is a temporary Phase-02
+ * gallery rendition, not Aurora's photographic source of truth and never feeds the computational
+ * pipeline.
  *
  * The implementation intentionally stays simple and deterministic: 2x2 Bayer block reconstruction,
  * black/white normalization, capture white-balance gains, optional Camera2 color transform, robust
@@ -27,7 +31,6 @@ import kotlin.math.pow
  * pipeline. Phase 03+ can replace this renderer without changing the AURAW source contract.
  */
 object AuroraRawPreviewRenderer {
-    private const val PUBLIC_RELATIVE_DIRECTORY = "Pictures/Aurora/Preview"
     private const val MIME_TYPE_JPEG = "image/jpeg"
     private const val MAX_LONG_EDGE = 1600
     private const val HISTOGRAM_BINS = 2048
@@ -116,15 +119,15 @@ object AuroraRawPreviewRenderer {
         val s11 = normalize(readRaw16(packet, x + 1, y + 1), black[3], whiteLevel)
 
         val sensor = when (cfa) {
-            0 -> doubleArrayOf(s00 * gains.red, ((s10 + s01) * 0.5) * gains.green, s11 * gains.blue) // RGGB
-            1 -> doubleArrayOf(s10 * gains.red, ((s00 + s11) * 0.5) * gains.green, s01 * gains.blue) // GRBG
-            2 -> doubleArrayOf(s01 * gains.red, ((s00 + s11) * 0.5) * gains.green, s10 * gains.blue) // GBRG
-            3 -> doubleArrayOf(s11 * gains.red, ((s10 + s01) * 0.5) * gains.green, s00 * gains.blue) // BGGR
-            4 -> { // RGB arrangement: use local values conservatively as already color-separated-ish.
+            0 -> doubleArrayOf(s00 * gains.red, ((s10 + s01) * 0.5) * gains.green, s11 * gains.blue)
+            1 -> doubleArrayOf(s10 * gains.red, ((s00 + s11) * 0.5) * gains.green, s01 * gains.blue)
+            2 -> doubleArrayOf(s01 * gains.red, ((s00 + s11) * 0.5) * gains.green, s10 * gains.blue)
+            3 -> doubleArrayOf(s11 * gains.red, ((s10 + s01) * 0.5) * gains.green, s00 * gains.blue)
+            4 -> {
                 val avg = (s00 + s10 + s01 + s11) * 0.25
                 doubleArrayOf(avg * gains.red, avg * gains.green, avg * gains.blue)
             }
-            else -> { // MONO / unknown monochrome-like public constants.
+            else -> {
                 val avg = (s00 + s10 + s01 + s11) * 0.25
                 doubleArrayOf(avg, avg, avg)
             }
@@ -226,15 +229,15 @@ object AuroraRawPreviewRenderer {
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
             put(MediaStore.Images.Media.MIME_TYPE, MIME_TYPE_JPEG)
-            put(MediaStore.Images.Media.RELATIVE_PATH, PUBLIC_RELATIVE_DIRECTORY)
+            put(MediaStore.Images.Media.RELATIVE_PATH, CameraStoragePolicy.VISIBLE_ALBUM_RELATIVE_PATH)
             put(MediaStore.Images.Media.IS_PENDING, 1)
         }
         val collection = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
         val uri = resolver.insert(collection, values)
-            ?: throw IllegalStateException("MediaStore Images refused RAW preview destination")
+            ?: throw IllegalStateException("MediaStore Images refused Camera album destination")
         try {
             val stream = resolver.openOutputStream(uri, "w")
-                ?: throw IllegalStateException("Unable to open RAW preview destination")
+                ?: throw IllegalStateException("Unable to open Camera album destination")
             stream.use {
                 check(bitmap.compress(Bitmap.CompressFormat.JPEG, 92, it)) { "JPEG preview encoder failed" }
             }
@@ -244,8 +247,8 @@ object AuroraRawPreviewRenderer {
                 null,
                 null,
             )
-            check(updated == 1) { "Unable to publish RAW preview" }
-            return File("/$PUBLIC_RELATIVE_DIRECTORY", fileName)
+            check(updated == 1) { "Unable to publish Camera album rendition" }
+            return File("/${CameraStoragePolicy.VISIBLE_ALBUM_RELATIVE_PATH}", fileName)
         } catch (t: Throwable) {
             runCatching { resolver.delete(uri, null, null) }
             throw t
