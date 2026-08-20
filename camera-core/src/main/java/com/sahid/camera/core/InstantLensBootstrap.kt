@@ -16,23 +16,29 @@ import kotlin.math.atan
  * aliases remain in the cache but only each family's default route reaches the normal selector.
  *
  * On a brand-new ROM/install it does the minimum public Camera2 work necessary to start one usable
- * rear camera; ProgressiveLensDiscovery fills the remaining family map after preview startup.
+ * rear camera; ProgressiveLensDiscovery fills the remaining family map only after the first live
+ * preview frame (or a safety timeout).
  */
 data class InstantLensBootstrapResult(
     val lenses: List<LensCapability>,
     val learned: Boolean,
+    /** False means the current ROM + classifier already has a complete metadata-family cache. */
+    val backgroundDiscoveryNeeded: Boolean,
 )
 
 object InstantLensBootstrap {
     fun load(context: Context): InstantLensBootstrapResult {
         val appContext = context.applicationContext
         val learned = LearnedLensStore(appContext).load().routes
-        val readyCandidates = CandidateLensStore(appContext).load()
+        val candidateStore = CandidateLensStore(appContext)
+        val backgroundDiscoveryNeeded = !candidateStore.hasCompletedAutoScan()
+        val readyCandidates = candidateStore.load()
 
         if (learned.isNotEmpty()) {
             return InstantLensBootstrapResult(
                 lenses = LensFamilyResolver.defaultsForSelector(learned + readyCandidates),
                 learned = true,
+                backgroundDiscoveryNeeded = backgroundDiscoveryNeeded,
             )
         }
 
@@ -41,12 +47,14 @@ object InstantLensBootstrap {
             return InstantLensBootstrapResult(
                 lenses = LensFamilyResolver.defaultsForSelector(listOfNotNull(primaryHint) + readyCandidates),
                 learned = false,
+                backgroundDiscoveryNeeded = backgroundDiscoveryNeeded,
             )
         }
 
         return InstantLensBootstrapResult(
             lenses = listOfNotNull(primaryHint),
             learned = false,
+            backgroundDiscoveryNeeded = true,
         )
     }
 
