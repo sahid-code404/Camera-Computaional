@@ -33,7 +33,10 @@ class DeepHiddenJavaProbe(context: Context) : Closeable {
     private val handler = Handler(thread.looper)
     private val executor = Executor { command -> handler.post(command) }
 
-    fun probeDirectOpen(cameraId: String): JavaDirectOpenProbe {
+    fun probeDirectOpen(
+        cameraId: String,
+        timeoutMs: Long = DEFAULT_OPEN_TIMEOUT_MS,
+    ): JavaDirectOpenProbe {
         if (ContextCompat.checkSelfPermission(appContext, Manifest.permission.CAMERA) !=
             PackageManager.PERMISSION_GRANTED
         ) {
@@ -72,13 +75,14 @@ class DeepHiddenJavaProbe(context: Context) : Closeable {
             )
         }
 
-        val signalled = latch.await(OPEN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        val boundedTimeout = timeoutMs.coerceIn(MIN_OPEN_TIMEOUT_MS, MAX_OPEN_TIMEOUT_MS)
+        val signalled = latch.await(boundedTimeout, TimeUnit.MILLISECONDS)
         val camera = cameraRef.getAndSet(null)
         runCatching { camera?.close() }
         return JavaDirectOpenProbe(
             cameraId = cameraId,
             opened = signalled && camera != null,
-            detail = if (signalled) detailRef.get() else "open timed out",
+            detail = if (signalled) detailRef.get() else "open timed out ${boundedTimeout}ms",
         )
     }
 
@@ -87,6 +91,8 @@ class DeepHiddenJavaProbe(context: Context) : Closeable {
     }
 
     private companion object {
-        const val OPEN_TIMEOUT_MS = 1_200L
+        const val MIN_OPEN_TIMEOUT_MS = 100L
+        const val DEFAULT_OPEN_TIMEOUT_MS = 300L
+        const val MAX_OPEN_TIMEOUT_MS = 1_500L
     }
 }
