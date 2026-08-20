@@ -21,10 +21,16 @@ import kotlin.math.atan
  * metadata view are merged into transient lens candidates. Selecting a candidate performs the real
  * open/session/frame test in CameraPreviewController; only a real frame is written to the learned
  * route cache.
+ *
+ * Metadata-valid helper/logical aliases are not automatically useful lenses. Before publishing the
+ * selector map, [LensValueFilter] collapses only strongly proven optical duplicates and prefers an
+ * already frame-proven/public route. Distinct FOVs remain visible.
  */
 class ProgressiveLensDiscovery(context: Context) {
     private val appContext = context.applicationContext
     private val manager = appContext.getSystemService(CameraManager::class.java)
+    private val learnedStore = LearnedLensStore(appContext)
+    private val candidateStore = CandidateLensStore(appContext)
 
     fun discover(maxNumericId: Int = AUTO_METADATA_MAX_ID): List<LensCapability> {
         val javaIds = runCatching { manager.cameraIdList.toList() }
@@ -57,14 +63,14 @@ class ProgressiveLensDiscovery(context: Context) {
         }
 
         // Metadata-valid numeric IDs can include OEM auxiliary cameras omitted from both public ID
-        // lists. They are cheap to discover because this stage does not call openCamera().
+        // lists. This stage is cheap because it does not call openCamera().
         autoNative.forEach autoLoop@ { info ->
             if (info.id in javaSet || info.id in ndkAdvertisedSet) return@autoLoop
             autoNativeCandidate(info)?.let(candidates::add)
         }
 
-        // Java logical/physical topology is also metadata-only. A child is exposed only when its
-        // own characteristics contain a renderable stream configuration.
+        // Java logical/physical topology is metadata-only. A child is exposed only when its own
+        // characteristics contain a renderable stream configuration.
         javaChars.forEach { (logicalId, logicalChars) ->
             logicalChars.physicalCameraIds.forEach physicalLoop@ { physicalId ->
                 if (candidates.any { it.cameraId == physicalId }) return@physicalLoop
@@ -74,17 +80,28 @@ class ProgressiveLensDiscovery(context: Context) {
             }
         }
 
-        // Hidden logical metadata can reveal child IDs even when Java cannot address the parent.
-        // Directly metadata-addressable children are already included above. NDK physical-via-
-        // logical routing remains a separate Phase-01 edge case and is not faked here.
-        val preferred = candidates
+        val preferredMetadataRoutes = candidates
             .filter { it.userVisible }
             .groupBy { it.cameraId }
             .values
             .mapNotNull { routes -> routes.minByOrNull(::routeScore) }
-            .sortedWith(compareBy(::cameraSortKey))
 
-        return preferred.map { it.copy(displayName = "ID ${it.cameraId}") }
+        // Include existing frame-proven routes as optical anchors. This is what prevents a helper
+        // alias such as another main-camera endpoint from reappearing beside the already proven
+        // main lens while still preserving truly different ultrawide/tele/macro FOVs.
+        val learnedRoutes = learnedStore.load().routes.filter { it.userVisible }
+        val selectorRoutes = LensValueFilter.filterForSelector(
+            learnedRoutes + preferredMetadataRoutes
+        )
+
+        // Remember useful-but-unproven candidates separately. They reappear instantly after a
+        // restart but remain visibly distinct from LEARNED routes until a real frame is received.
+        val learnedIds = learnedRoutes.mapTo(mutableSetOf()) { it.cameraId }
+        candidateStore.replace(
+            selectorRoutes.filter { route -> route.cameraId !in learnedIds }
+        )
+
+        return selectorRoutes.map { it.copy(displayName = "ID ${it.cameraId}") }
     }
 
     private fun javaCandidate(
@@ -255,8 +272,6 @@ class ProgressiveLensDiscovery(context: Context) {
         CameraAccessPath.NDK_DIRECT -> 10
         CameraAccessPath.PHYSICAL_VIA_LOGICAL -> 20
     }
-
-    private fun cameraSortKey(lens: LensCapability): Int = lens.cameraId.toIntOrNull() ?: Int.MAX_VALUE
 
     private fun area(size: Size): Long = size.width.toLong() * size.height.toLong()
 
