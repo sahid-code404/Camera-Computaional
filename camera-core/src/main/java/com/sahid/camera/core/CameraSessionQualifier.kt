@@ -17,6 +17,7 @@ import android.os.HandlerThread
 import android.util.Size
 import android.view.Surface
 import androidx.core.content.ContextCompat
+import com.sahid.camera.aurora.NativeCameraEnumerator
 import java.io.Closeable
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
@@ -26,9 +27,9 @@ import java.util.concurrent.atomic.AtomicReference
 /**
  * Phase-01 runtime session qualifier.
  *
- * A lens is only considered user-visible after an actual CameraCaptureSession with a
- * preview output configures successfully. If RAW is advertised, preview + RAW_SENSOR
- * is separately tested and only receives a RAW badge when that combination configures.
+ * Discovery metadata never decides visibility. We first prove the configured access path can
+ * open, then try a real SurfaceTexture preview session. If that metadata/path is unusual we
+ * also try a YUV stream and RAW rather than dropping the candidate early.
  */
 class CameraSessionQualifier(context: Context) : Closeable {
     private val appContext = context.applicationContext
@@ -44,65 +45,145 @@ class CameraSessionQualifier(context: Context) : Closeable {
             )
         }
 
-        val previewSize = chooseQualificationPreviewSize(lens.previewSizes)
-            ?: return lens.copy(
-                qualification = LensQualification.unqualified("No preview stream available"),
-            )
-
-        val open = openCamera(lens.logicalCameraId)
-        val camera = open.camera
-            ?: return lens.copy(
-                qualification = LensQualification.unqualified(open.detail),
-            )
-
-        return try {
-            val previewCheck = checkSession(camera, lens, previewSize, rawSize = null)
-            if (!previewCheck.supported) {
-                lens.copy(
-                    qualification = LensQualification.unqualified("Preview rejected: ${previewCheck.detail}"),
-                )
-            } else if (!lens.rawSupported || lens.rawSizes.isEmpty()) {
-                lens.copy(
-                    qualification = LensQualification(
-                        previewSessionQualified = true,
-                        rawSessionQualified = false,
-                        qualifiedRawSize = null,
-                        detail = "Preview session qualified; RAW not advertised",
-                    ),
-                )
-            } else {
-                val rawCandidates = boundedRawCandidates(lens.rawSizes)
-                var qualifiedRaw: Size? = null
-                var lastRawDetail = "RAW session was not tested"
-
-                for (rawSize in rawCandidates) {
-                    val rawCheck = checkSession(camera, lens, previewSize, rawSize)
-                    lastRawDetail = rawCheck.detail
-                    if (rawCheck.supported) {
-                        qualifiedRaw = rawSize
-                        break
-                    }
+        val nativeOpenDetail = if (lens.accessPath == CameraAccessPath.NDK_DIRECT) {
+            val nativeProbe = runCatching { NativeCameraEnumerator.probeDirectOpen(lens.cameraId) }
+                .getOrElse {
+                    return lens.copy(
+                        qualification = LensQualification.unqualified(
+                            "NDK direct open probe failed: ${it.javaClass.simpleName}"
+                        ),
+                    )
                 }
-
-                lens.copy(
-                    qualification = LensQualification(
-                        previewSessionQualified = true,
-                        rawSessionQualified = qualifiedRaw != null,
-                        qualifiedRawSize = qualifiedRaw,
-                        detail = if (qualifiedRaw != null) {
-                            "Preview + RAW ${qualifiedRaw.width}×${qualifiedRaw.height} session qualified"
-                        } else {
-                            "Preview qualified; RAW combination rejected: $lastRawDetail"
-                        },
+            if (!nativeProbe.opened) {
+                return lens.copy(
+                    qualification = LensQualification.unqualified(
+                        "NDK direct open rejected with status ${nativeProbe.status}"
                     ),
                 )
             }
+            "NDK direct open OK; "
+        } else {
+            ""
+        }
+
+        val open = openCamera(lens.openCameraId)
+        val camera = open.camera
+            ?: return lens.copy(
+                qualification = LensQualification.unqualified(nativeOpenDetail + open.detail),
+            )
+
+        return try {
+            val previewSize = chooseQualificationSize(lens.previewSizes)
+            val yuvSize = chooseQualificationSize(lens.yuvSizes)
+
+            val previewCheck = previewSize?.let {
+                checkSession(camera, lens, previewSize = it)
+            }
+            val previewQualified = previewCheck?.supported == true
+
+            // If SurfaceTexture metadata/session is missing or rejected, prove another real
+            // camera output before deciding the candidate is useless.
+            val yuvCheck = if (!previewQualified && yuvSize != null) {
+                checkSession(camera, lens, yuvSize = yuvSize)
+            } else {
+                null
+            }
+            val yuvQualified = yuvCheck?.supported == true
+
+            val rawResult = qualifyRaw(
+                camera = camera,
+                lens = lens,
+                previewSize = previewSize.takeIf { previewQualified },
+                yuvSize = yuvSize.takeIf { yuvQualified },
+            )
+
+            val detail = buildString {
+                append(nativeOpenDetail)
+                append("open ")
+                append(lens.openCameraId)
+                append(" OK")
+                when {
+                    previewQualified -> append("; preview OK ${previewSize!!.width}×${previewSize.height}")
+                    previewCheck != null -> append("; preview rejected (${previewCheck.detail})")
+                    else -> append("; no SurfaceTexture/private preview size")
+                }
+                when {
+                    yuvQualified -> append("; YUV fallback OK ${yuvSize!!.width}×${yuvSize.height}")
+                    yuvCheck != null -> append("; YUV rejected (${yuvCheck.detail})")
+                    !previewQualified && lens.yuvSizes.isEmpty() -> append("; no YUV fallback size")
+                }
+                if (lens.rawSupported) {
+                    if (rawResult.qualifiedSize != null) {
+                        append("; RAW OK ${rawResult.qualifiedSize.width}×${rawResult.qualifiedSize.height}")
+                        append(" via ${rawResult.mode}")
+                    } else {
+                        append("; RAW rejected (${rawResult.detail})")
+                    }
+                } else {
+                    append("; RAW not advertised")
+                }
+            }
+
+            lens.copy(
+                qualification = LensQualification(
+                    accessPathOpenQualified = true,
+                    previewSessionQualified = previewQualified,
+                    yuvSessionQualified = yuvQualified,
+                    rawSessionQualified = rawResult.qualifiedSize != null,
+                    qualifiedRawSize = rawResult.qualifiedSize,
+                    detail = detail,
+                ),
+            )
         } finally {
             runCatching { camera.close() }
         }
     }
 
-    private fun chooseQualificationPreviewSize(sizes: List<Size>): Size? {
+    private fun qualifyRaw(
+        camera: CameraDevice,
+        lens: LensCapability,
+        previewSize: Size?,
+        yuvSize: Size?,
+    ): RawQualification {
+        if (!lens.rawSupported) return RawQualification(null, "none", "RAW not advertised")
+        if (lens.rawSizes.isEmpty()) return RawQualification(null, "none", "no RAW output size")
+
+        var lastDetail = "RAW session not configured"
+        for (rawSize in boundedRawCandidates(lens.rawSizes)) {
+            val primary = when {
+                previewSize != null -> checkSession(
+                    camera,
+                    lens,
+                    previewSize = previewSize,
+                    rawSize = rawSize,
+                ) to "preview+raw"
+                yuvSize != null -> checkSession(
+                    camera,
+                    lens,
+                    yuvSize = yuvSize,
+                    rawSize = rawSize,
+                ) to "yuv+raw"
+                else -> checkSession(camera, lens, rawSize = rawSize) to "raw-only"
+            }
+            lastDetail = primary.first.detail
+            if (primary.first.supported) {
+                return RawQualification(rawSize, primary.second, primary.first.detail)
+            }
+
+            // A device can support RAW capture while rejecting a simultaneous preview/RAW
+            // combination. Prove the RAW endpoint itself before declaring RAW unusable.
+            if (previewSize != null || yuvSize != null) {
+                val standalone = checkSession(camera, lens, rawSize = rawSize)
+                lastDetail = standalone.detail
+                if (standalone.supported) {
+                    return RawQualification(rawSize, "raw-only", standalone.detail)
+                }
+            }
+        }
+        return RawQualification(null, "none", lastDetail)
+    }
+
+    private fun chooseQualificationSize(sizes: List<Size>): Size? {
         if (sizes.isEmpty()) return null
         val bounded = sizes.filter {
             it.width <= 1920 && it.height <= 1920 &&
@@ -111,11 +192,6 @@ class CameraSessionQualifier(context: Context) : Closeable {
         return (bounded.ifEmpty { sizes }).maxByOrNull { it.width.toLong() * it.height.toLong() }
     }
 
-    /**
-     * Prefer maximum RAW first, but bound worst-case probing time on devices that advertise
-     * a very large number of redundant sizes. The smallest advertised size is retained as
-     * a final compatibility probe.
-     */
     private fun boundedRawCandidates(sizes: List<Size>): List<Size> {
         val sorted = sizes.distinct().sortedByDescending { it.width.toLong() * it.height.toLong() }
         if (sorted.size <= MAX_RAW_PROBES) return sorted
@@ -162,43 +238,57 @@ class CameraSessionQualifier(context: Context) : Closeable {
     private fun checkSession(
         camera: CameraDevice,
         lens: LensCapability,
-        previewSize: Size,
-        rawSize: Size?,
+        previewSize: Size? = null,
+        yuvSize: Size? = null,
+        rawSize: Size? = null,
     ): SessionCheck {
-        val query = querySupportIfAvailable(lens, previewSize, rawSize)
+        if (previewSize == null && yuvSize == null && rawSize == null) {
+            return SessionCheck(false, "No output supplied")
+        }
+
+        val query = querySupportIfAvailable(lens, previewSize, yuvSize, rawSize)
         if (query == false) {
             return SessionCheck(false, "CameraDeviceSetup rejected configuration")
         }
 
-        val texture = try {
-            SurfaceTexture(false).apply {
-                setDefaultBufferSize(previewSize.width, previewSize.height)
-            }
-        } catch (t: Throwable) {
-            return SessionCheck(false, "SurfaceTexture failed: ${t.javaClass.simpleName}")
+        val texture = previewSize?.let { size ->
+            runCatching {
+                SurfaceTexture(false).apply {
+                    setDefaultBufferSize(size.width, size.height)
+                }
+            }.getOrNull()
         }
-        val previewSurface = Surface(texture)
+        if (previewSize != null && texture == null) {
+            return SessionCheck(false, "SurfaceTexture allocation failed")
+        }
+        val previewSurface = texture?.let(::Surface)
+        val yuvReader = yuvSize?.let {
+            runCatching {
+                ImageReader.newInstance(it.width, it.height, ImageFormat.YUV_420_888, 2)
+            }.getOrNull()
+        }
         val rawReader = rawSize?.let {
             runCatching {
                 ImageReader.newInstance(it.width, it.height, ImageFormat.RAW_SENSOR, 2)
             }.getOrNull()
         }
 
+        if (yuvSize != null && yuvReader == null) {
+            previewSurface?.release()
+            texture?.release()
+            return SessionCheck(false, "YUV ImageReader allocation failed")
+        }
         if (rawSize != null && rawReader == null) {
-            previewSurface.release()
-            texture.release()
+            yuvReader?.close()
+            previewSurface?.release()
+            texture?.release()
             return SessionCheck(false, "RAW ImageReader allocation failed")
         }
 
         val outputs = mutableListOf<OutputConfiguration>()
-        outputs += OutputConfiguration(previewSurface).apply {
-            lens.physicalCameraId?.let(::setPhysicalCameraId)
-        }
-        rawReader?.let { reader ->
-            outputs += OutputConfiguration(reader.surface).apply {
-                lens.physicalCameraId?.let(::setPhysicalCameraId)
-            }
-        }
+        previewSurface?.let { outputs += physicalOutput(it, lens) }
+        yuvReader?.surface?.let { outputs += physicalOutput(it, lens) }
+        rawReader?.surface?.let { outputs += physicalOutput(it, lens) }
 
         val latch = CountDownLatch(1)
         val sessionRef = AtomicReference<CameraCaptureSession?>()
@@ -237,34 +327,53 @@ class CameraSessionQualifier(context: Context) : Closeable {
 
         runCatching { sessionRef.getAndSet(null)?.close() }
         runCatching { rawReader?.close() }
-        runCatching { previewSurface.release() }
-        runCatching { texture.release() }
+        runCatching { yuvReader?.close() }
+        runCatching { previewSurface?.release() }
+        runCatching { texture?.release() }
         return resultRef.get()
     }
 
-    /**
-     * API 35+ can reject unsupported combinations without paying session-creation cost.
-     * We still create the real session afterward; this is only a fast negative gate.
-     */
+    private fun physicalOutput(surface: Surface, lens: LensCapability): OutputConfiguration =
+        OutputConfiguration(surface).apply {
+            if (lens.accessPath == CameraAccessPath.PHYSICAL_VIA_LOGICAL) {
+                lens.physicalCameraId?.let(::setPhysicalCameraId)
+            }
+        }
+
+    /** API 35+ fast-negative check; a real session is still created after a positive result. */
     private fun querySupportIfAvailable(
         lens: LensCapability,
-        previewSize: Size,
+        previewSize: Size?,
+        yuvSize: Size?,
         rawSize: Size?,
     ): Boolean? {
         if (Build.VERSION.SDK_INT < 35) return null
 
         return runCatching {
-            if (!manager.isCameraDeviceSetupSupported(lens.logicalCameraId)) {
+            if (!manager.isCameraDeviceSetupSupported(lens.openCameraId)) {
                 return@runCatching null
             }
 
             val outputs = mutableListOf<OutputConfiguration>()
-            outputs += OutputConfiguration(previewSize, SurfaceTexture::class.java).apply {
-                lens.physicalCameraId?.let(::setPhysicalCameraId)
+            previewSize?.let { size ->
+                outputs += OutputConfiguration(size, SurfaceTexture::class.java).apply {
+                    if (lens.accessPath == CameraAccessPath.PHYSICAL_VIA_LOGICAL) {
+                        lens.physicalCameraId?.let(::setPhysicalCameraId)
+                    }
+                }
+            }
+            yuvSize?.let { size ->
+                outputs += OutputConfiguration(ImageFormat.YUV_420_888, size).apply {
+                    if (lens.accessPath == CameraAccessPath.PHYSICAL_VIA_LOGICAL) {
+                        lens.physicalCameraId?.let(::setPhysicalCameraId)
+                    }
+                }
             }
             rawSize?.let { size ->
                 outputs += OutputConfiguration(ImageFormat.RAW_SENSOR, size).apply {
-                    lens.physicalCameraId?.let(::setPhysicalCameraId)
+                    if (lens.accessPath == CameraAccessPath.PHYSICAL_VIA_LOGICAL) {
+                        lens.physicalCameraId?.let(::setPhysicalCameraId)
+                    }
                 }
             }
 
@@ -278,7 +387,7 @@ class CameraSessionQualifier(context: Context) : Closeable {
                 executor,
                 noOpCallback,
             )
-            manager.getCameraDeviceSetup(lens.logicalCameraId)
+            manager.getCameraDeviceSetup(lens.openCameraId)
                 .isSessionConfigurationSupported(config)
         }.getOrNull()
     }
@@ -289,6 +398,11 @@ class CameraSessionQualifier(context: Context) : Closeable {
 
     private data class OpenResult(val camera: CameraDevice?, val detail: String)
     private data class SessionCheck(val supported: Boolean, val detail: String)
+    private data class RawQualification(
+        val qualifiedSize: Size?,
+        val mode: String,
+        val detail: String,
+    )
 
     private companion object {
         const val OPEN_TIMEOUT_MS = 4_000L
