@@ -31,12 +31,14 @@ import java.util.Locale
  *   M bytes  exact RAW plane payload
  *
  * Android 10+ publishes the finished canonical record through MediaStore into the user-visible
- * Pictures/Aurora/RAW directory. IS_PENDING keeps a partially written capture invisible until the
- * complete metadata + RAW payload has been flushed. Android 9 keeps the conservative app-specific
- * fallback because public legacy storage requires the old runtime storage permission.
+ * Documents/Aurora/RAW directory. AURAW is an application/octet-stream source record rather than a
+ * rendered image, so MediaStore.Files must use a generic-file primary directory such as Documents
+ * or Download. IS_PENDING keeps a partially written capture invisible until the complete metadata
+ * + RAW payload has been flushed. Android 9 keeps the conservative app-specific fallback because
+ * public legacy storage requires the old runtime storage permission.
  */
 object AuroraRawWriter {
-    private const val PUBLIC_RELATIVE_DIRECTORY = "Pictures/Aurora/RAW"
+    private const val PUBLIC_RELATIVE_DIRECTORY = "Documents/Aurora/RAW"
     private const val MIME_TYPE_AURAW = "application/octet-stream"
 
     private val magic = byteArrayOf(
