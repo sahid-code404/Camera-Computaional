@@ -39,17 +39,14 @@ class ProgressiveLensDiscovery(context: Context) {
             .getOrDefault(emptyList())
         val ndkAdvertisedSet = ndkAdvertised.map { it.id }.toSet()
         val autoNative = AutoHiddenMetadataEnumerator.scan(maxNumericId)
-        val autoById = autoNative.associateBy { it.id }
-        val ndkById = buildMap<String, NativeCameraInfo> {
-            ndkAdvertised.forEach { put(it.id, it) }
-        }
 
         val candidates = mutableListOf<LensCapability>()
 
-        javaIds.forEach { id ->
+        javaIds.forEach javaLoop@ { id ->
+            val chars = javaChars[id] ?: return@javaLoop
             javaCandidate(
                 id = id,
-                chars = javaChars[id] ?: return@forEach,
+                chars = chars,
                 alsoNdk = id in ndkAdvertisedSet,
             )?.let(candidates::add)
         }
@@ -61,18 +58,18 @@ class ProgressiveLensDiscovery(context: Context) {
 
         // Metadata-valid numeric IDs can include OEM auxiliary cameras omitted from both public ID
         // lists. They are cheap to discover because this stage does not call openCamera().
-        autoNative.forEach { info ->
-            if (info.id in javaSet || info.id in ndkAdvertisedSet) return@forEach
+        autoNative.forEach autoLoop@ { info ->
+            if (info.id in javaSet || info.id in ndkAdvertisedSet) return@autoLoop
             autoNativeCandidate(info)?.let(candidates::add)
         }
 
         // Java logical/physical topology is also metadata-only. A child is exposed only when its
         // own characteristics contain a renderable stream configuration.
         javaChars.forEach { (logicalId, logicalChars) ->
-            logicalChars.physicalCameraIds.forEach { physicalId ->
-                if (candidates.any { it.cameraId == physicalId }) return@forEach
+            logicalChars.physicalCameraIds.forEach physicalLoop@ { physicalId ->
+                if (candidates.any { it.cameraId == physicalId }) return@physicalLoop
                 val childChars = runCatching { manager.getCameraCharacteristics(physicalId) }.getOrNull()
-                    ?: return@forEach
+                    ?: return@physicalLoop
                 javaPhysicalCandidate(logicalId, physicalId, childChars)?.let(candidates::add)
             }
         }
