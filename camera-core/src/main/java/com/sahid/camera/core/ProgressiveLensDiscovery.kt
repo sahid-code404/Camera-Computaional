@@ -21,8 +21,9 @@ import kotlin.math.atan
  * metadata view are merged into route profiles. [LensFamilyResolver] then exposes one default route
  * per physical lens family while [CandidateLensStore] retains every alias/profile internally.
  *
- * The expensive metadata pass is performed only once per Build.FINGERPRINT. Later launches restore
- * the complete learned + candidate family map from SharedPreferences and return immediately.
+ * The expensive metadata pass is performed only once per Build.FINGERPRINT + classifier version.
+ * Later launches restore the complete learned + candidate family map from SharedPreferences and
+ * return immediately.
  */
 class ProgressiveLensDiscovery(context: Context) {
     private val appContext = context.applicationContext
@@ -30,7 +31,7 @@ class ProgressiveLensDiscovery(context: Context) {
     private val learnedStore = LearnedLensStore(appContext)
     private val candidateStore = CandidateLensStore(appContext)
 
-    fun discover(maxNumericId: Int = AUTO_METADATA_MAX_ID): List<LensCapability> {
+    fun discover(maxNumericId: Int? = null): List<LensCapability> {
         val cachedLearned = learnedStore.load().routes.filter { it.userVisible }
         if (candidateStore.hasCompletedAutoScan()) {
             return LensFamilyResolver.defaultsForSelector(cachedLearned + candidateStore.load())
@@ -47,7 +48,19 @@ class ProgressiveLensDiscovery(context: Context) {
         val ndkAdvertised = runCatching { NativeCameraEnumerator.enumerate() }
             .getOrDefault(emptyList())
         val ndkAdvertisedSet = ndkAdvertised.map { it.id }.toSet()
-        val autoNative = AutoHiddenMetadataEnumerator.scan(maxNumericId)
+
+        // Most HALs stay well below 255, so the common case remains exactly as fast as before.
+        // Phones that already reveal a high numeric public/physical endpoint automatically extend
+        // the one-time metadata window just beyond that range, bounded by the global safety cap.
+        val knownIdsForRange = buildList {
+            addAll(javaIds)
+            addAll(ndkAdvertised.map { it.id })
+            javaChars.values.forEach { addAll(it.physicalCameraIds) }
+        }
+        val resolvedMaxNumericId = maxNumericId
+            ?.coerceIn(0, LensFamilyPolicy.MAX_NUMERIC_SCAN_ID)
+            ?: LensFamilyPolicy.adaptiveNumericScanMax(knownIdsForRange)
+        val autoNative = AutoHiddenMetadataEnumerator.scan(resolvedMaxNumericId)
 
         val candidates = mutableListOf<LensCapability>()
 
@@ -271,8 +284,4 @@ class ProgressiveLensDiscovery(context: Context) {
     }
 
     private fun area(size: Size): Long = size.width.toLong() * size.height.toLong()
-
-    private companion object {
-        const val AUTO_METADATA_MAX_ID = 255
-    }
 }
