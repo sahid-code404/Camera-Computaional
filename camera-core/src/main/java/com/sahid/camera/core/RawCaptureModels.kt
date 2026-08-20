@@ -42,7 +42,11 @@ data class RawImagePacket(
 }
 
 data class RawCaptureRecord(
+    /** Preferred user-facing item. In Phase 02 this is the DCIM/Camera rendition when available. */
     val file: File,
+    /** Immutable source-of-truth AURAW master retained for Aurora processing/export. */
+    val canonicalFile: File,
+    /** Derived gallery rendition; never a computational input. */
     val previewFile: File? = null,
     val cameraId: String,
     val accessPath: CameraAccessPath,
