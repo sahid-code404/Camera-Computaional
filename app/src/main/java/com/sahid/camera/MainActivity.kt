@@ -54,6 +54,7 @@ import com.sahid.camera.core.CameraCapabilityProbe
 import com.sahid.camera.core.CameraDiagnostics
 import com.sahid.camera.core.CameraDiscoverySource
 import com.sahid.camera.core.CameraPreviewController
+import com.sahid.camera.core.CameraQualificationReport
 import com.sahid.camera.core.LensCapability
 import com.sahid.camera.ui.CameraTheme
 import com.sahid.camera.update.OtaCheckResult
@@ -114,7 +115,7 @@ private fun PermissionScreen(onGrant: () -> Unit) {
             Text("Camera permission is required", color = Color.White, fontSize = 20.sp)
             Spacer(Modifier.height(16.dp))
             Text(
-                "Phase 01 compares advertised Java/NDK cameras, logical topology, and a bounded hidden-ID scan before real-frame qualification.",
+                "Camera starts from learned + advertised lens routes. Hidden-ID deep discovery runs only when you request it.",
                 color = Color.LightGray,
             )
             Spacer(Modifier.height(24.dp))
@@ -130,7 +131,8 @@ private fun CameraScreen() {
     var lenses by remember { mutableStateOf<List<LensCapability>>(emptyList()) }
     var selectedLens by remember { mutableStateOf<LensCapability?>(null) }
     var diagnosticsJson by remember { mutableStateOf<String?>(null) }
-    var status by remember { mutableStateOf("Searching Java + NDK + logical + hidden IDs 0–255…") }
+    var status by remember { mutableStateOf("Loading learned lens map…") }
+    var lensScanBusy by remember { mutableStateOf(false) }
     var otaResult by remember { mutableStateOf<OtaCheckResult?>(null) }
     var otaBusy by remember { mutableStateOf(false) }
     var otaMessage by remember { mutableStateOf("Checking OTA…") }
@@ -140,38 +142,38 @@ private fun CameraScreen() {
         }.getOrElse { "Aurora native core unavailable" }
     }
 
-    LaunchedEffect(Unit) {
-        val report = withContext(Dispatchers.Default) {
-            CameraCapabilityProbe(context).probeQualificationReport()
-        }
+    fun applyReport(report: CameraQualificationReport, prefix: String) {
         lenses = report.visibleLenses
-        selectedLens = report.visibleLenses.firstOrNull { !it.isFrontFacing }
+        val currentId = selectedLens?.cameraId
+        selectedLens = currentId?.let { id -> report.visibleLenses.firstOrNull { it.cameraId == id } }
+            ?: report.visibleLenses.firstOrNull { !it.isFrontFacing }
             ?: report.visibleLenses.firstOrNull()
         diagnosticsJson = CameraDiagnostics.toJson(report)
         status = buildString {
-            append("Java ")
+            append(prefix)
+            append(" • Java ")
             append(report.discovery.javaDirectIds.size)
             append(" • NDK ")
             append(report.discovery.ndkDirectIds.size)
             append(" • hidden ")
             append(report.discovery.hiddenDiscoveredIds.size)
-            append(" • qualified ")
+            append(" • lenses ")
             append(report.visibleLenses.size)
-            append('/')
-            append(report.candidates.map { it.cameraId }.distinct().size)
-            val hiddenVisible = report.visibleLenses.count {
-                CameraDiscoverySource.HIDDEN_ID_PROBE in it.discoverySources
+            val learned = report.visibleLenses.count {
+                CameraDiscoverySource.LEARNED_CACHE in it.discoverySources
             }
-            if (hiddenVisible > 0) {
-                append(" • hidden-live ")
-                append(hiddenVisible)
-            }
-            val nativeVisible = report.visibleLenses.count { it.accessPath == CameraAccessPath.NDK_DIRECT }
-            if (nativeVisible > 0) {
-                append(" • native ")
-                append(nativeVisible)
+            if (learned > 0) {
+                append(" • learned ")
+                append(learned)
             }
         }
+    }
+
+    LaunchedEffect(Unit) {
+        val report = withContext(Dispatchers.Default) {
+            CameraCapabilityProbe(context).probeFastQualificationReport()
+        }
+        applyReport(report, "Fast startup")
     }
 
     LaunchedEffect(Unit) {
@@ -224,11 +226,38 @@ private fun CameraScreen() {
             Spacer(Modifier.height(12.dp))
             ModeRow()
             Spacer(Modifier.height(10.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 diagnosticsJson?.let { diagnostics ->
                     Button(onClick = { shareDiagnostics(context, diagnostics) }) {
-                        Text("Share diagnostics", fontSize = 11.sp)
+                        Text("Diagnostics", fontSize = 10.sp)
                     }
+                }
+
+                Button(
+                    enabled = !lensScanBusy,
+                    onClick = {
+                        scope.launch {
+                            lensScanBusy = true
+                            val previousId = selectedLens?.cameraId
+                            // Release the active preview before deep camera opens so OEM camera
+                            // resource arbitration cannot create false negatives.
+                            selectedLens = null
+                            status = "Deep hidden-lens scan… this runs only on demand"
+                            val report = withContext(Dispatchers.Default) {
+                                CameraCapabilityProbe(context).probeDeepQualificationReport()
+                            }
+                            lenses = report.visibleLenses
+                            selectedLens = previousId?.let { id ->
+                                report.visibleLenses.firstOrNull { it.cameraId == id }
+                            } ?: report.visibleLenses.firstOrNull { !it.isFrontFacing }
+                                ?: report.visibleLenses.firstOrNull()
+                            diagnosticsJson = CameraDiagnostics.toJson(report)
+                            status = "Lens map learned • ${report.visibleLenses.size} working cameras cached for this ROM"
+                            lensScanBusy = false
+                        }
+                    },
+                ) {
+                    Text(if (lensScanBusy) "Scanning…" else "Find lenses", fontSize = 10.sp)
                 }
 
                 Button(
@@ -271,11 +300,11 @@ private fun CameraScreen() {
                 ) {
                     Text(
                         when {
-                            otaBusy -> "Please wait…"
+                            otaBusy -> "Wait…"
                             otaResult is OtaCheckResult.Available -> "Update"
-                            else -> "Check update"
+                            else -> "OTA"
                         },
-                        fontSize = 11.sp,
+                        fontSize = 10.sp,
                     )
                 }
             }
@@ -290,7 +319,7 @@ private fun CameraScreen() {
             )
             Spacer(Modifier.height(6.dp))
             Text(
-                "Advertised + hidden-ID candidates require real Surface/YUV frames • RAW-only stays diagnostic",
+                "Normal launch: learned + advertised routes only • Find lenses: deep hidden scan + real-frame cache",
                 color = Color.Gray,
                 fontSize = 10.sp,
             )
@@ -312,8 +341,9 @@ private fun LensSelector(
             val isSelected = selected?.stableId == lens.stableId
             val qualifiedRaw = lens.qualification.qualifiedRawSize
             val hidden = CameraDiscoverySource.HIDDEN_ID_PROBE in lens.discoverySources
+            val learned = CameraDiscoverySource.LEARNED_CACHE in lens.discoverySources
             val previewLabel = buildString {
-                if (hidden) append("Hidden • ")
+                if (learned) append("Learned • ") else if (hidden) append("Hidden • ")
                 append(
                     when {
                         lens.accessPath == CameraAccessPath.NDK_DIRECT && lens.qualification.previewSessionQualified ->
