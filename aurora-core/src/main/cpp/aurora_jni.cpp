@@ -1,7 +1,12 @@
 #include <jni.h>
 
+#include <android/native_window.h>
+#include <android/native_window_jni.h>
+#include <camera/NdkCameraCaptureSession.h>
+#include <camera/NdkCameraDevice.h>
 #include <camera/NdkCameraManager.h>
 #include <camera/NdkCameraMetadata.h>
+#include <camera/NdkCaptureRequest.h>
 #include <media/NdkImage.h>
 
 #include <algorithm>
@@ -18,6 +23,31 @@ namespace {
 struct NativeSize {
     int32_t width;
     int32_t height;
+};
+
+enum class SessionStage : int32_t {
+    MANAGER = 1,
+    OPEN = 2,
+    WINDOW = 3,
+    OUTPUT_CONTAINER = 4,
+    OUTPUT = 5,
+    REQUEST = 6,
+    TARGET = 7,
+    CAPTURE_SESSION = 8,
+    SUBMIT = 9,
+    RUNNING = 10,
+};
+
+struct NativeSession {
+    ACameraManager* manager = nullptr;
+    ACameraDevice* device = nullptr;
+    ACameraCaptureSession* session = nullptr;
+    ACaptureSessionOutputContainer* outputContainer = nullptr;
+    ACaptureSessionOutput* output = nullptr;
+    ACaptureRequest* request = nullptr;
+    ACameraOutputTarget* target = nullptr;
+    ANativeWindow* window = nullptr;
+    int sequenceId = -1;
 };
 
 std::string jsonEscape(const char* value) {
@@ -64,6 +94,22 @@ bool readFloat(const ACameraMetadata* metadata, uint32_t tag, float* value) {
         return false;
     }
     *value = entry.data.f[0];
+    return true;
+}
+
+bool readFloatPair(
+    const ACameraMetadata* metadata,
+    uint32_t tag,
+    float* first,
+    float* second) {
+    ACameraMetadata_const_entry entry{};
+    if (metadata == nullptr || first == nullptr || second == nullptr ||
+        ACameraMetadata_getConstEntry(metadata, tag, &entry) != ACAMERA_OK ||
+        entry.count < 2 || entry.data.f == nullptr) {
+        return false;
+    }
+    *first = entry.data.f[0];
+    *second = entry.data.f[1];
     return true;
 }
 
@@ -127,6 +173,76 @@ void appendSizesJson(std::ostringstream& out, const std::vector<NativeSize>& siz
     out << ']';
 }
 
+void deviceDisconnected(void*, ACameraDevice*) {}
+void deviceError(void*, ACameraDevice*, int) {}
+void sessionClosed(void*, ACameraCaptureSession*) {}
+void sessionReady(void*, ACameraCaptureSession*) {}
+void sessionActive(void*, ACameraCaptureSession*) {}
+
+void destroySession(NativeSession* state) {
+    if (state == nullptr) return;
+
+    if (state->session != nullptr) {
+        ACameraCaptureSession_stopRepeating(state->session);
+        ACameraCaptureSession_abortCaptures(state->session);
+        ACameraCaptureSession_close(state->session);
+        state->session = nullptr;
+    }
+    if (state->request != nullptr) {
+        ACaptureRequest_free(state->request);
+        state->request = nullptr;
+    }
+    if (state->target != nullptr) {
+        ACameraOutputTarget_free(state->target);
+        state->target = nullptr;
+    }
+    if (state->outputContainer != nullptr && state->output != nullptr) {
+        ACaptureSessionOutputContainer_remove(state->outputContainer, state->output);
+    }
+    if (state->output != nullptr) {
+        ACaptureSessionOutput_free(state->output);
+        state->output = nullptr;
+    }
+    if (state->outputContainer != nullptr) {
+        ACaptureSessionOutputContainer_free(state->outputContainer);
+        state->outputContainer = nullptr;
+    }
+    if (state->window != nullptr) {
+        ANativeWindow_release(state->window);
+        state->window = nullptr;
+    }
+    if (state->device != nullptr) {
+        ACameraDevice_close(state->device);
+        state->device = nullptr;
+    }
+    if (state->manager != nullptr) {
+        ACameraManager_delete(state->manager);
+        state->manager = nullptr;
+    }
+    delete state;
+}
+
+jlongArray sessionResult(
+    JNIEnv* env,
+    NativeSession* session,
+    camera_status_t status,
+    SessionStage stage,
+    bool opened) {
+    jlong values[4] = {
+        session == nullptr
+            ? static_cast<jlong>(0)
+            : static_cast<jlong>(reinterpret_cast<intptr_t>(session)),
+        static_cast<jlong>(status),
+        static_cast<jlong>(stage),
+        opened ? static_cast<jlong>(1) : static_cast<jlong>(0),
+    };
+    jlongArray array = env->NewLongArray(4);
+    if (array != nullptr) {
+        env->SetLongArrayRegion(array, 0, 4, values);
+    }
+    return array;
+}
+
 }  // namespace
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -165,6 +281,8 @@ Java_com_sahid_camera_aurora_NativeCameraEnumerator_nativeEnumerateJson(
             uint8_t hardwareLevel = 0;
             uint8_t facing = 0;
             float focalLength = 0.0f;
+            float sensorWidth = 0.0f;
+            float sensorHeight = 0.0f;
             const bool hasHardwareLevel =
                 metadataStatus == ACAMERA_OK &&
                 readByte(metadata, ACAMERA_INFO_SUPPORTED_HARDWARE_LEVEL, &hardwareLevel);
@@ -173,6 +291,13 @@ Java_com_sahid_camera_aurora_NativeCameraEnumerator_nativeEnumerateJson(
             const bool hasFocalLength =
                 metadataStatus == ACAMERA_OK &&
                 readFloat(metadata, ACAMERA_LENS_INFO_AVAILABLE_FOCAL_LENGTHS, &focalLength);
+            const bool hasSensorPhysicalSize =
+                metadataStatus == ACAMERA_OK &&
+                readFloatPair(
+                    metadata,
+                    ACAMERA_SENSOR_INFO_PHYSICAL_SIZE,
+                    &sensorWidth,
+                    &sensorHeight);
             const bool rawCapability =
                 metadataStatus == ACAMERA_OK &&
                 hasByteValue(
@@ -198,6 +323,10 @@ Java_com_sahid_camera_aurora_NativeCameraEnumerator_nativeEnumerateJson(
             if (hasFacing) out << static_cast<int>(facing); else out << "null";
             out << ",\"focalLengthMm\":";
             if (hasFocalLength) out << focalLength; else out << "null";
+            out << ",\"sensorWidthMm\":";
+            if (hasSensorPhysicalSize) out << sensorWidth; else out << "null";
+            out << ",\"sensorHeightMm\":";
+            if (hasSensorPhysicalSize) out << sensorHeight; else out << "null";
             out << ",\"rawCapability\":" << (rawCapability ? "true" : "false")
                 << ",\"privateOutputSizes\":";
             appendSizesJson(out, privateSizes);
@@ -246,8 +375,8 @@ Java_com_sahid_camera_aurora_NativeCameraEnumerator_nativeProbeDirectOpen(
 
     ACameraDevice_StateCallbacks callbacks{};
     callbacks.context = nullptr;
-    callbacks.onDisconnected = [](void*, ACameraDevice*) {};
-    callbacks.onError = [](void*, ACameraDevice*, int) {};
+    callbacks.onDisconnected = deviceDisconnected;
+    callbacks.onError = deviceError;
 
     ACameraDevice* device = nullptr;
     const camera_status_t status =
@@ -260,4 +389,160 @@ Java_com_sahid_camera_aurora_NativeCameraEnumerator_nativeProbeDirectOpen(
     env->ReleaseStringUTFChars(cameraIdValue, cameraId);
 
     return static_cast<jint>(status);
+}
+
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_com_sahid_camera_aurora_NativeCameraSession_nativeStartSession(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jstring cameraIdValue,
+    jobject surface,
+    jint templateValue,
+    jboolean repeating) {
+    if (cameraIdValue == nullptr || surface == nullptr) {
+        return sessionResult(
+            env,
+            nullptr,
+            ACAMERA_ERROR_INVALID_PARAMETER,
+            SessionStage::MANAGER,
+            false);
+    }
+
+    const char* cameraId = env->GetStringUTFChars(cameraIdValue, nullptr);
+    if (cameraId == nullptr) {
+        return sessionResult(
+            env,
+            nullptr,
+            ACAMERA_ERROR_INVALID_PARAMETER,
+            SessionStage::MANAGER,
+            false);
+    }
+
+    NativeSession* state = new NativeSession();
+    camera_status_t status = ACAMERA_OK;
+    SessionStage stage = SessionStage::MANAGER;
+    bool opened = false;
+
+    state->manager = ACameraManager_create();
+    if (state->manager == nullptr) {
+        status = ACAMERA_ERROR_UNKNOWN;
+        env->ReleaseStringUTFChars(cameraIdValue, cameraId);
+        delete state;
+        return sessionResult(env, nullptr, status, stage, false);
+    }
+
+    ACameraDevice_StateCallbacks deviceCallbacks{};
+    deviceCallbacks.context = nullptr;
+    deviceCallbacks.onDisconnected = deviceDisconnected;
+    deviceCallbacks.onError = deviceError;
+
+    stage = SessionStage::OPEN;
+    status = ACameraManager_openCamera(
+        state->manager,
+        cameraId,
+        &deviceCallbacks,
+        &state->device);
+    env->ReleaseStringUTFChars(cameraIdValue, cameraId);
+    if (status != ACAMERA_OK || state->device == nullptr) {
+        destroySession(state);
+        return sessionResult(env, nullptr, status, stage, false);
+    }
+    opened = true;
+
+    stage = SessionStage::WINDOW;
+    state->window = ANativeWindow_fromSurface(env, surface);
+    if (state->window == nullptr) {
+        destroySession(state);
+        return sessionResult(env, nullptr, ACAMERA_ERROR_INVALID_PARAMETER, stage, opened);
+    }
+
+    stage = SessionStage::OUTPUT_CONTAINER;
+    status = ACaptureSessionOutputContainer_create(&state->outputContainer);
+    if (status != ACAMERA_OK || state->outputContainer == nullptr) {
+        destroySession(state);
+        return sessionResult(env, nullptr, status, stage, opened);
+    }
+
+    stage = SessionStage::OUTPUT;
+    status = ACaptureSessionOutput_create(state->window, &state->output);
+    if (status != ACAMERA_OK || state->output == nullptr) {
+        destroySession(state);
+        return sessionResult(env, nullptr, status, stage, opened);
+    }
+    status = ACaptureSessionOutputContainer_add(state->outputContainer, state->output);
+    if (status != ACAMERA_OK) {
+        destroySession(state);
+        return sessionResult(env, nullptr, status, stage, opened);
+    }
+
+    stage = SessionStage::REQUEST;
+    const auto requestTemplate = static_cast<ACameraDevice_request_template>(templateValue);
+    status = ACameraDevice_createCaptureRequest(state->device, requestTemplate, &state->request);
+    if (status != ACAMERA_OK || state->request == nullptr) {
+        destroySession(state);
+        return sessionResult(env, nullptr, status, stage, opened);
+    }
+
+    stage = SessionStage::TARGET;
+    status = ACameraOutputTarget_create(state->window, &state->target);
+    if (status != ACAMERA_OK || state->target == nullptr) {
+        destroySession(state);
+        return sessionResult(env, nullptr, status, stage, opened);
+    }
+    status = ACaptureRequest_addTarget(state->request, state->target);
+    if (status != ACAMERA_OK) {
+        destroySession(state);
+        return sessionResult(env, nullptr, status, stage, opened);
+    }
+
+    ACameraCaptureSession_stateCallbacks sessionCallbacks{};
+    sessionCallbacks.context = nullptr;
+    sessionCallbacks.onClosed = sessionClosed;
+    sessionCallbacks.onReady = sessionReady;
+    sessionCallbacks.onActive = sessionActive;
+
+    stage = SessionStage::CAPTURE_SESSION;
+    status = ACameraDevice_createCaptureSession(
+        state->device,
+        state->outputContainer,
+        &sessionCallbacks,
+        &state->session);
+    if (status != ACAMERA_OK || state->session == nullptr) {
+        destroySession(state);
+        return sessionResult(env, nullptr, status, stage, opened);
+    }
+
+    ACaptureRequest* requests[] = {state->request};
+    stage = SessionStage::SUBMIT;
+    if (repeating == JNI_TRUE) {
+        status = ACameraCaptureSession_setRepeatingRequest(
+            state->session,
+            nullptr,
+            1,
+            requests,
+            &state->sequenceId);
+    } else {
+        status = ACameraCaptureSession_capture(
+            state->session,
+            nullptr,
+            1,
+            requests,
+            &state->sequenceId);
+    }
+    if (status != ACAMERA_OK) {
+        destroySession(state);
+        return sessionResult(env, nullptr, status, stage, opened);
+    }
+
+    return sessionResult(env, state, ACAMERA_OK, SessionStage::RUNNING, opened);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_sahid_camera_aurora_NativeCameraSession_nativeStopSession(
+    JNIEnv*,
+    jobject /* thiz */,
+    jlong handle) {
+    if (handle == 0) return;
+    auto* state = reinterpret_cast<NativeSession*>(static_cast<intptr_t>(handle));
+    destroySession(state);
 }
