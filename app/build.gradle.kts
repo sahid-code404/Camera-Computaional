@@ -6,12 +6,12 @@ plugins {
 
 android {
     namespace = "com.sahid.camera"
-    compileSdk = 37
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.sahid.camera"
         minSdk = 28
-        targetSdk = 37
+        targetSdk = 36
         versionCode = 1
         versionName = "0.1.0-foundation"
 
