@@ -5,14 +5,18 @@ import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import kotlin.math.PI
+import kotlin.math.atan
 
 /**
  * Zero-scan startup path.
  *
- * With a learned map this reads SharedPreferences only. On a brand-new ROM/install it does the
- * minimum public Camera2 work necessary to start one usable camera: walk advertised IDs until a
- * rear-facing preview route is found, then stop. ProgressiveLensDiscovery fills every other public,
- * NDK and metadata-hidden candidate after the preview has already started.
+ * With a learned map this reads SharedPreferences only. Useful metadata candidates discovered on a
+ * previous launch are restored from a separate candidate cache, so additional lenses do not need to
+ * be rediscovered before appearing again. Frame-proven routes always outrank candidate routes.
+ *
+ * On a brand-new ROM/install it does the minimum public Camera2 work necessary to start one usable
+ * rear camera; ProgressiveLensDiscovery fills the remaining map after preview startup.
  */
 data class InstantLensBootstrapResult(
     val lenses: List<LensCapability>,
@@ -23,14 +27,31 @@ object InstantLensBootstrap {
     fun load(context: Context): InstantLensBootstrapResult {
         val appContext = context.applicationContext
         val learned = LearnedLensStore(appContext).load().routes
+        val readyCandidates = CandidateLensStore(appContext).load()
+
         if (learned.isNotEmpty()) {
             return InstantLensBootstrapResult(
-                lenses = learned.sortedWith(compareBy(::cameraIdSortKey)),
+                lenses = LensValueFilter.filterForSelector(learned + readyCandidates),
                 learned = true,
             )
         }
 
-        val manager = appContext.getSystemService(CameraManager::class.java)
+        val primaryHint = findPrimaryPublicHint(appContext)
+        if (readyCandidates.isNotEmpty()) {
+            return InstantLensBootstrapResult(
+                lenses = LensValueFilter.filterForSelector(listOfNotNull(primaryHint) + readyCandidates),
+                learned = false,
+            )
+        }
+
+        return InstantLensBootstrapResult(
+            lenses = listOfNotNull(primaryHint),
+            learned = false,
+        )
+    }
+
+    private fun findPrimaryPublicHint(context: Context): LensCapability? {
+        val manager = context.getSystemService(CameraManager::class.java)
         val ids = runCatching { manager.cameraIdList.toList() }.getOrDefault(emptyList())
         var firstUsable: LensCapability? = null
 
@@ -39,15 +60,10 @@ object InstantLensBootstrap {
                 ?: continue
             val hint = buildHint(cameraId, chars) ?: continue
             if (firstUsable == null) firstUsable = hint
-            if (!hint.isFrontFacing) {
-                return InstantLensBootstrapResult(listOf(hint), learned = false)
-            }
+            if (!hint.isFrontFacing) return hint
         }
 
-        return InstantLensBootstrapResult(
-            lenses = listOfNotNull(firstUsable),
-            learned = false,
-        )
+        return firstUsable
     }
 
     private fun buildHint(
@@ -92,7 +108,7 @@ object InstantLensBootstrap {
             focalLengthMm = focalLength,
             sensorWidthMm = physicalSize?.width,
             sensorHeightMm = physicalSize?.height,
-            horizontalFovDegrees = null,
+            horizontalFovDegrees = horizontalFov(physicalSize?.width, focalLength),
             rawSupported = CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW in capabilities,
             rawSizes = rawSizes,
             previewSizes = previewSizes,
@@ -113,6 +129,8 @@ object InstantLensBootstrap {
         )
     }
 
-    private fun cameraIdSortKey(lens: LensCapability): Int =
-        lens.cameraId.toIntOrNull() ?: Int.MAX_VALUE
+    private fun horizontalFov(sensorWidthMm: Float?, focalMm: Float?): Float? {
+        if (sensorWidthMm == null || focalMm == null || sensorWidthMm <= 0f || focalMm <= 0f) return null
+        return (2.0 * atan(sensorWidthMm / (2.0 * focalMm)) * 180.0 / PI).toFloat()
+    }
 }
