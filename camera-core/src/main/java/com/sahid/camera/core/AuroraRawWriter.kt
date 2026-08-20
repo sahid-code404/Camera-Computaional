@@ -11,6 +11,7 @@ import java.io.BufferedOutputStream
 import java.io.DataOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.ByteOrder
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -21,7 +22,7 @@ import java.util.Locale
  *
  * The RAW payload is copied byte-for-byte from the single RAW_SENSOR Image plane. Aurora does not
  * demosaic, tone-map, compress, reinterpret, or convert the sensor samples before persistence.
- * Row/pixel stride are stored in the JSON header so padding remains unambiguous.
+ * Row/pixel stride and byte order are stored in the JSON header so padding/layout stay unambiguous.
  *
  * Container v1 layout (big-endian scalar fields):
  *   8 bytes  magic = AURAW\0\1\0
@@ -32,9 +33,8 @@ import java.util.Locale
  *
  * Android 10+ publishes AURAW through MediaStore.Downloads. AURAW is a generic binary source
  * record, not a rendered image, so Download/Aurora/RAW is the portable scoped-storage destination
- * across OEMs. IS_PENDING keeps partial files invisible until the full metadata + RAW payload has
- * been flushed. Android 9 keeps the conservative app-specific fallback because public legacy
- * storage requires the old runtime storage permission.
+ * across OEMs. A separate best-effort JPEG preview may be derived from the SAME packet for human
+ * inspection; that JPEG is explicitly non-canonical and never feeds Aurora's computational path.
  */
 object AuroraRawWriter {
     private const val PUBLIC_RELATIVE_DIRECTORY = "Download/Aurora/RAW"
@@ -55,11 +55,17 @@ object AuroraRawWriter {
     ): RawCaptureRecord {
         require(packet.imageFormat == ImageFormat.RAW_SENSOR)
         val digest = sha256(packet.bytes)
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+        val lensId = lens.cameraId.replace(Regex("[^A-Za-z0-9._-]"), "_")
+        val fileName = "AURORA_${stamp}_ID-${lensId}.auraw"
+        val previewFileName = "AURORA_${stamp}_ID-${lensId}_preview.jpg"
+
         val metadata = JSONObject()
             .put("container", "AURAW")
             .put("containerVersion", 1)
             .put("canonicalSource", true)
             .put("rawPayloadEncoding", "ANDROID_RAW_SENSOR_PLANE_BYTES")
+            .put("rawByteOrder", ByteOrder.nativeOrder().toString())
             .put("cameraId", lens.cameraId)
             .put("logicalCameraId", lens.logicalCameraId)
             .put("physicalCameraId", lens.physicalCameraId ?: JSONObject.NULL)
@@ -75,14 +81,18 @@ object AuroraRawWriter {
             .put("payloadSha256", digest)
             .put("buildFingerprint", Build.FINGERPRINT)
             .put("sdkInt", Build.VERSION.SDK_INT)
+            .put(
+                "derivedPreview",
+                JSONObject()
+                    .put("canonical", false)
+                    .put("feedsComputationalPipeline", false)
+                    .put("fileName", previewFileName)
+                    .put("renderer", "AURORA_PHASE02_BAYER_QUALIFICATION_PREVIEW"),
+            )
             .put("staticMetadata", staticMetadata)
             .put("captureMetadata", dynamicMetadata)
 
         val metadataBytes = metadata.toString().toByteArray(Charsets.UTF_8)
-        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
-        val lensId = lens.cameraId.replace(Regex("[^A-Za-z0-9._-]"), "_")
-        val fileName = "AURORA_${stamp}_ID-${lensId}.auraw"
-
         val displayFile = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             writeMediaStore(context, fileName, metadataBytes, packet.bytes)
             File("/$PUBLIC_RELATIVE_DIRECTORY", fileName)
@@ -90,8 +100,22 @@ object AuroraRawWriter {
             writeLegacyAppSpecific(context, fileName, metadataBytes, packet.bytes)
         }
 
+        // RAW persistence is the transaction that matters. Preview rendering happens only after the
+        // immutable source record has been safely finalized, and a renderer failure never deletes or
+        // invalidates the canonical AURAW file.
+        val previewFile = runCatching {
+            AuroraRawPreviewRenderer.renderAndPublish(
+                context = context,
+                fileName = previewFileName,
+                packet = packet,
+                staticMetadata = staticMetadata,
+                dynamicMetadata = dynamicMetadata,
+            )
+        }.getOrNull()
+
         return RawCaptureRecord(
             file = displayFile,
+            previewFile = previewFile,
             cameraId = lens.cameraId,
             accessPath = lens.accessPath,
             width = packet.width,
