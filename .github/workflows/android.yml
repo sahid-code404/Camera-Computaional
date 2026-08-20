@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 45
     env:
       CAMERA_VERSION_CODE: ${{ github.run_number }}
-      CAMERA_VERSION_NAME: "0.1.0-phase01.${{ github.run_number }}"
+      CAMERA_VERSION_NAME: "0.2.0-phase02.${{ github.run_number }}"
 
     steps:
       - name: Checkout
@@ -103,6 +103,6 @@ jobs:
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Camera-foundation-debug-apk
+          name: Camera-phase02-single-raw-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
