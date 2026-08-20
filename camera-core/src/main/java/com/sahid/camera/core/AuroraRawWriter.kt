@@ -30,15 +30,14 @@ import java.util.Locale
  *   N bytes  UTF-8 JSON metadata
  *   M bytes  exact RAW plane payload
  *
- * Android 10+ publishes the finished canonical record through MediaStore into the user-visible
- * Documents/Aurora/RAW directory. AURAW is an application/octet-stream source record rather than a
- * rendered image, so MediaStore.Files must use a generic-file primary directory such as Documents
- * or Download. IS_PENDING keeps a partially written capture invisible until the complete metadata
- * + RAW payload has been flushed. Android 9 keeps the conservative app-specific fallback because
- * public legacy storage requires the old runtime storage permission.
+ * Android 10+ publishes AURAW through MediaStore.Downloads. AURAW is a generic binary source
+ * record, not a rendered image, so Download/Aurora/RAW is the portable scoped-storage destination
+ * across OEMs. IS_PENDING keeps partial files invisible until the full metadata + RAW payload has
+ * been flushed. Android 9 keeps the conservative app-specific fallback because public legacy
+ * storage requires the old runtime storage permission.
  */
 object AuroraRawWriter {
-    private const val PUBLIC_RELATIVE_DIRECTORY = "Documents/Aurora/RAW"
+    private const val PUBLIC_RELATIVE_DIRECTORY = "Download/Aurora/RAW"
     private const val MIME_TYPE_AURAW = "application/octet-stream"
 
     private val magic = byteArrayOf(
@@ -86,8 +85,6 @@ object AuroraRawWriter {
 
         val displayFile = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             writeMediaStore(context, fileName, metadataBytes, packet.bytes)
-            // The File is a display/location descriptor for Phase-02 UI. The actual write above is
-            // performed through the MediaStore content Uri, as required by scoped storage.
             File("/$PUBLIC_RELATIVE_DIRECTORY", fileName)
         } else {
             writeLegacyAppSpecific(context, fileName, metadataBytes, packet.bytes)
@@ -118,9 +115,9 @@ object AuroraRawWriter {
             put(MediaStore.MediaColumns.RELATIVE_PATH, PUBLIC_RELATIVE_DIRECTORY)
             put(MediaStore.MediaColumns.IS_PENDING, 1)
         }
-        val collection = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
         val uri = resolver.insert(collection, values)
-            ?: throw IllegalStateException("MediaStore refused RAW destination")
+            ?: throw IllegalStateException("MediaStore Downloads refused RAW destination")
 
         try {
             val stream = resolver.openOutputStream(uri, "w")
@@ -146,7 +143,7 @@ object AuroraRawWriter {
         metadataBytes: ByteArray,
         payload: ByteArray,
     ): File {
-        val external = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
+        val external = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
         val directory = File(external ?: context.filesDir, "Aurora/RAW")
         if (!directory.exists() && !directory.mkdirs()) {
             throw IllegalStateException("Unable to create ${directory.absolutePath}")
