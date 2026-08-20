@@ -35,6 +35,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -55,7 +56,6 @@ import com.sahid.camera.core.CameraDiagnostics
 import com.sahid.camera.core.CameraDiscoverySource
 import com.sahid.camera.core.CameraPreviewController
 import com.sahid.camera.core.InstantLensBootstrap
-import com.sahid.camera.core.LearnedLensStore
 import com.sahid.camera.core.LensCapability
 import com.sahid.camera.core.LensValueFilter
 import com.sahid.camera.core.ProgressiveLensDiscovery
@@ -132,7 +132,6 @@ private fun PermissionScreen(onGrant: () -> Unit) {
 private fun CameraScreen() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val learnedStore = remember { LearnedLensStore(context) }
 
     // The hot path is intentionally tiny. A learned ROM reads only SharedPreferences; a fresh ROM
     // performs only enough standard Java advertised metadata work to start the primary preview.
@@ -152,13 +151,15 @@ private fun CameraScreen() {
                 bootstrap.learned && bootstrap.lenses.isNotEmpty() ->
                     "Instant lens map • ${bootstrap.lenses.size} useful cameras cached"
                 bootstrap.lenses.isNotEmpty() ->
-                    "Opening camera • discovering extra lenses automatically"
+                    "Opening camera • extra lenses will follow after first frame"
                 else -> "Discovering cameras automatically…"
             }
         )
     }
     var lensScanBusy by remember { mutableStateOf(false) }
     var autoDiscoveryBusy by remember { mutableStateOf(false) }
+    var autoDiscoveryStarted by remember { mutableStateOf(false) }
+    var firstPreviewFrameSeen by remember { mutableStateOf(false) }
     var otaResult by remember { mutableStateOf<OtaCheckResult?>(null) }
     var otaBusy by remember { mutableStateOf(false) }
     var otaMessage by remember { mutableStateOf("Checking OTA…") }
@@ -168,11 +169,9 @@ private fun CameraScreen() {
         }.getOrElse { "Aurora native core unavailable" }
     }
 
-    // Progressive first-launch discovery runs only after preview startup. The discovery layer now
-    // filters helper/logical aliases by strong optical identity and persists useful metadata
-    // candidates separately from frame-proven routes.
-    LaunchedEffect(Unit) {
-        delay(150)
+    suspend fun runAutomaticDiscoveryIfNeeded() {
+        if (!bootstrap.backgroundDiscoveryNeeded || autoDiscoveryStarted) return
+        autoDiscoveryStarted = true
         autoDiscoveryBusy = true
         val discovered = withContext(Dispatchers.Default) {
             ProgressiveLensDiscovery(context).discover()
@@ -180,41 +179,37 @@ private fun CameraScreen() {
         autoDiscoveryBusy = false
 
         if (discovered.isNotEmpty()) {
-            val previousSelectedId = selectedLens?.cameraId
+            val previousSelectedStableId = selectedLens?.stableId
+            val previousSelectedCameraId = selectedLens?.cameraId
             val beforeIds = lenses.map { it.cameraId }.toSet()
             lenses = LensValueFilter.filterForSelector(lenses + discovered)
-            selectedLens = previousSelectedId?.let { id ->
+            selectedLens = previousSelectedStableId?.let { stableId ->
+                lenses.firstOrNull { it.stableId == stableId }
+            } ?: previousSelectedCameraId?.let { id ->
                 lenses.firstOrNull { it.cameraId == id }
             } ?: lenses.firstOrNull { it.learnedFromCache && !it.isFrontFacing }
                 ?: lenses.firstOrNull { !it.isFrontFacing }
                 ?: lenses.firstOrNull()
 
             val newCount = lenses.count { it.cameraId !in beforeIds }
-            if (newCount > 0 && status.startsWith("Discovering cameras")) {
+            if (newCount > 0) {
                 status = "Ready • $newCount useful lens${if (newCount == 1) "" else "es"} found automatically"
             }
         }
     }
 
-    // The live controller writes LEARNED_CACHE only after an actual TextureView/ImageReader frame.
-    // Poll the tiny SharedPreferences map briefly after a selection so the chip promotes from
-    // Ready/Auto to Learned immediately instead of waiting for an app restart.
-    LaunchedEffect(selectedLens?.stableId) {
-        val selectedId = selectedLens?.cameraId ?: return@LaunchedEffect
-        repeat(20) {
-            delay(100)
-            val provenRoutes = withContext(Dispatchers.Default) {
-                learnedStore.load().routes
-            }
-            val proven = provenRoutes.firstOrNull { it.cameraId == selectedId }
-            if (proven != null) {
-                lenses = LensValueFilter.filterForSelector(lenses + provenRoutes)
-                selectedLens = lenses.firstOrNull {
-                    it.cameraId == selectedId && it.learnedFromCache
-                } ?: lenses.firstOrNull { it.cameraId == selectedId }
-                return@LaunchedEffect
-            }
+    // Fast phones start discovery immediately after their first real preview frame. This avoids a
+    // fixed timer racing CameraService on slower OEMs. A safety timeout prevents a broken primary
+    // route from blocking discovery forever; if no public hint exists we start immediately.
+    LaunchedEffect(firstPreviewFrameSeen, bootstrap.backgroundDiscoveryNeeded) {
+        if (firstPreviewFrameSeen) {
+            runAutomaticDiscoveryIfNeeded()
         }
+    }
+    LaunchedEffect(Unit) {
+        if (!bootstrap.backgroundDiscoveryNeeded) return@LaunchedEffect
+        if (lenses.isNotEmpty()) delay(AUTO_DISCOVERY_SAFETY_DELAY_MS)
+        runAutomaticDiscoveryIfNeeded()
     }
 
     // OTA/network work is independent of camera startup and never triggers camera discovery.
@@ -235,6 +230,21 @@ private fun CameraScreen() {
             CameraPreview(
                 lens = lens,
                 onStatus = { status = it },
+                onRouteProven = { proven ->
+                    firstPreviewFrameSeen = true
+                    val previousStableId = selectedLens?.stableId
+                    val previousCameraId = selectedLens?.cameraId
+                    lenses = LensValueFilter.filterForSelector(lenses + proven)
+                    selectedLens = lenses.firstOrNull { it.stableId == proven.stableId }
+                        ?: previousStableId?.let { stableId ->
+                            lenses.firstOrNull { it.stableId == stableId }
+                        }
+                        ?: previousCameraId?.let { id ->
+                            lenses.firstOrNull { it.cameraId == id }
+                        }
+                        ?: lenses.firstOrNull { !it.isFrontFacing }
+                        ?: lenses.firstOrNull()
+                },
                 modifier = Modifier.fillMaxSize(),
             )
         }
@@ -363,7 +373,9 @@ private fun CameraScreen() {
             Spacer(Modifier.height(6.dp))
             Text(
                 if (autoDiscoveryBusy) {
-                    "Preview first • finding useful extra lenses in background…"
+                    "Preview live • finding useful extra lenses in background…"
+                } else if (bootstrap.backgroundDiscoveryNeeded && !autoDiscoveryStarted) {
+                    "Preview first • lens discovery waits for first real frame"
                 } else {
                     "Instant preview • useful lens cache • helper aliases hidden automatically"
                 },
@@ -458,12 +470,19 @@ private fun ModeRow() {
 private fun CameraPreview(
     lens: LensCapability,
     onStatus: (String) -> Unit,
+    onRouteProven: (LensCapability) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val latestStatus = rememberUpdatedState(onStatus)
+    val latestRouteProven = rememberUpdatedState(onRouteProven)
     val controller = remember {
-        CameraPreviewController(context.applicationContext, onStatus)
+        CameraPreviewController(
+            context = context.applicationContext,
+            onStatus = { latestStatus.value(it) },
+            onRouteProven = { latestRouteProven.value(it) },
+        )
     }
 
     AndroidView(
@@ -503,3 +522,5 @@ private fun shareDiagnostics(context: Context, diagnosticsJson: String) {
     }
     context.startActivity(Intent.createChooser(sendIntent, "Share Camera diagnostics"))
 }
+
+private const val AUTO_DISCOVERY_SAFETY_DELAY_MS = 1_500L
