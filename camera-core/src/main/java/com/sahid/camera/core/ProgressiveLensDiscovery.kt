@@ -89,13 +89,12 @@ class ProgressiveLensDiscovery(context: Context) {
             .mapNotNull { sameProfile -> sameProfile.firstOrNull() }
 
         val learnedRoutes = cachedLearned
-        val learnedStableIds = learnedRoutes.mapTo(mutableSetOf()) { it.stableId }
 
-        // Persist ALL unproven profiles before family collapsing. This is the critical difference
-        // from the old dedup cache: aliases survive restart and remain available for fallback/debug
-        // even though the normal selector shows only each family's default route.
+        // Persist ALL metadata profiles before family collapsing, including a metadata copy of an
+        // already-learned stable route. The learned copy carries real-frame proof while this copy
+        // can carry newer topology (physical child IDs, richer stream geometry) across restarts.
         candidateStore.replace(
-            metadataRoutes.filter { route -> route.stableId !in learnedStableIds },
+            metadataRoutes,
             autoScanCompleted = true,
         )
 
