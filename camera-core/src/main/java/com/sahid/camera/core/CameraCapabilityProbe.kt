@@ -10,16 +10,21 @@ import android.hardware.camera2.CameraManager
  * Camera2 capability discovery plus Phase-01 runtime session qualification.
  *
  * Static metadata is used to discover candidates. User-visible results must come from
- * [probeQualifiedLenses], which verifies real preview sessions and preview+RAW session
+ * [probeQualificationReport], which verifies real preview sessions and preview+RAW session
  * combinations before exposing a lens or RAW badge.
  */
 class CameraCapabilityProbe(context: Context) {
     private val appContext = context.applicationContext
     private val manager = appContext.getSystemService(CameraManager::class.java)
+    private val qualificationStore = LensQualificationStore(appContext)
 
     /** Metadata-only discovery. Useful for diagnostics; not sufficient for final UI filtering. */
     fun probeUsableLenses(): List<LensCapability> =
         assignUserFacingNames(selectMetadataPreferredCandidates(probeMetadataCandidates()))
+
+    fun probeQualifiedLenses(
+        onProgress: ((completed: Int, total: Int, lens: LensCapability) -> Unit)? = null,
+    ): List<LensCapability> = probeQualificationReport(onProgress).visibleLenses
 
     /**
      * Runtime-qualify all candidates on a worker thread.
@@ -27,12 +32,17 @@ class CameraCapabilityProbe(context: Context) {
      * Physical members are preferred when at least one of them configures successfully.
      * If every physical member of a logical camera is rejected, the logical stream is
      * retained as an honest fallback when it can create a real preview session.
+     *
+     * The complete accepted/rejected report is persisted by Build.FINGERPRINT for
+     * diagnostics, but cached results are never used to bypass a fresh runtime check.
      */
-    fun probeQualifiedLenses(
+    fun probeQualificationReport(
         onProgress: ((completed: Int, total: Int, lens: LensCapability) -> Unit)? = null,
-    ): List<LensCapability> {
+    ): CameraQualificationReport {
         val candidates = probeMetadataCandidates()
-        if (candidates.isEmpty()) return emptyList()
+        if (candidates.isEmpty()) {
+            return CameraQualificationReport(emptyList(), emptyList()).also(qualificationStore::save)
+        }
 
         val qualified = CameraSessionQualifier(appContext).use { qualifier ->
             candidates.mapIndexed { index, lens ->
@@ -57,7 +67,16 @@ class CameraCapabilityProbe(context: Context) {
             }
             .distinctBy { it.stableId }
 
-        return assignUserFacingNames(preferred.map { it.copy(displayName = "Lens") })
+        val namedVisible = assignUserFacingNames(preferred.map { it.copy(displayName = "Lens") })
+        val visibleNamesById = namedVisible.associate { it.stableId to it.displayName }
+        val namedCandidates = qualified.map { lens ->
+            lens.copy(displayName = visibleNamesById[lens.stableId] ?: lens.displayName)
+        }
+
+        return CameraQualificationReport(
+            candidates = namedCandidates,
+            visibleLenses = namedVisible,
+        ).also(qualificationStore::save)
     }
 
     private fun probeMetadataCandidates(): List<LensCapability> {

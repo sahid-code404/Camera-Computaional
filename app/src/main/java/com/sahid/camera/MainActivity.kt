@@ -1,6 +1,8 @@
 package com.sahid.camera
 
 import android.Manifest
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.view.TextureView
 import androidx.activity.ComponentActivity
@@ -47,6 +49,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.sahid.camera.aurora.AuroraNative
 import com.sahid.camera.core.CameraCapabilityProbe
+import com.sahid.camera.core.CameraDiagnostics
 import com.sahid.camera.core.CameraPreviewController
 import com.sahid.camera.core.LensCapability
 import com.sahid.camera.ui.CameraTheme
@@ -119,6 +122,7 @@ private fun CameraScreen() {
     val context = LocalContext.current
     var lenses by remember { mutableStateOf<List<LensCapability>>(emptyList()) }
     var selectedLens by remember { mutableStateOf<LensCapability?>(null) }
+    var diagnosticsJson by remember { mutableStateOf<String?>(null) }
     var status by remember { mutableStateOf("Qualifying Camera2 lens sessions…") }
     val nativeStatus = remember {
         runCatching {
@@ -127,15 +131,17 @@ private fun CameraScreen() {
     }
 
     LaunchedEffect(Unit) {
-        val result = withContext(Dispatchers.Default) {
-            CameraCapabilityProbe(context).probeQualifiedLenses()
+        val report = withContext(Dispatchers.Default) {
+            CameraCapabilityProbe(context).probeQualificationReport()
         }
-        lenses = result
-        selectedLens = result.firstOrNull { !it.isFrontFacing } ?: result.firstOrNull()
-        status = if (result.isEmpty()) {
+        lenses = report.visibleLenses
+        selectedLens = report.visibleLenses.firstOrNull { !it.isFrontFacing }
+            ?: report.visibleLenses.firstOrNull()
+        diagnosticsJson = CameraDiagnostics.toJson(report)
+        status = if (report.visibleLenses.isEmpty()) {
             "No runtime-qualified Camera2 lens sessions"
         } else {
-            "${result.size} runtime-qualified lens(es)"
+            "${report.visibleLenses.size}/${report.candidates.size} lens candidate(s) qualified"
         }
     }
 
@@ -169,9 +175,15 @@ private fun CameraScreen() {
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             LensSelector(lenses, selectedLens) { selectedLens = it }
-            Spacer(Modifier.height(14.dp))
+            Spacer(Modifier.height(12.dp))
             ModeRow()
-            Spacer(Modifier.height(14.dp))
+            Spacer(Modifier.height(10.dp))
+            diagnosticsJson?.let { diagnostics ->
+                Button(onClick = { shareDiagnostics(context, diagnostics) }) {
+                    Text("Share diagnostics", fontSize = 11.sp)
+                }
+                Spacer(Modifier.height(10.dp))
+            }
             Box(
                 modifier = Modifier
                     .size(76.dp)
@@ -282,4 +294,13 @@ private fun CameraPreview(
             controller.release()
         }
     }
+}
+
+private fun shareDiagnostics(context: Context, diagnosticsJson: String) {
+    val sendIntent = Intent(Intent.ACTION_SEND).apply {
+        type = "application/json"
+        putExtra(Intent.EXTRA_SUBJECT, "Camera Aurora Phase 01 diagnostics")
+        putExtra(Intent.EXTRA_TEXT, diagnosticsJson)
+    }
+    context.startActivity(Intent.createChooser(sendIntent, "Share Camera diagnostics"))
 }
