@@ -8,7 +8,7 @@ import org.json.JSONObject
 /** Produces a portable Phase-01 discovery/session report for physical-device testing. */
 object CameraDiagnostics {
     fun toJson(report: CameraQualificationReport): String = JSONObject().apply {
-        put("schemaVersion", 3)
+        put("schemaVersion", 4)
         put("generatedAtUnixMs", System.currentTimeMillis())
         put("device", JSONObject().apply {
             put("manufacturer", Build.MANUFACTURER)
@@ -21,17 +21,25 @@ object CameraDiagnostics {
         put("discovery", JSONObject().apply {
             put("javaDirectIds", stringArray(report.discovery.javaDirectIds))
             put("ndkDirectIds", stringArray(report.discovery.ndkDirectIds))
-            put("logicalTopology", JSONObject().apply {
-                report.discovery.logicalTopology.forEach { (logicalId, physicalIds) ->
-                    put(logicalId, stringArray(physicalIds))
-                }
-            })
+            put("logicalTopology", topologyJson(report.discovery.logicalTopology))
             put("javaOnlyIds", stringArray(
                 report.discovery.javaDirectIds.filterNot(report.discovery.ndkDirectIds::contains)
             ))
             put("ndkOnlyIds", stringArray(
                 report.discovery.ndkDirectIds.filterNot(report.discovery.javaDirectIds::contains)
             ))
+            put("hiddenProbe", JSONObject().apply {
+                put("maxNumericId", report.discovery.hiddenProbeMaxNumericId)
+                put("attemptedCount", report.discovery.hiddenProbeAttemptedCount)
+                put("metadataValidIds", stringArray(report.discovery.hiddenMetadataIds))
+                put("hiddenDiscoveredIds", stringArray(report.discovery.hiddenDiscoveredIds))
+                put("hiddenLogicalTopology", topologyJson(report.discovery.hiddenLogicalTopology))
+                put("rejectedStatuses", JSONObject().apply {
+                    report.discovery.hiddenRejectedStatuses.forEach { (cameraId, status) ->
+                        put(cameraId, status)
+                    }
+                })
+            })
         })
         put("summary", JSONObject().apply {
             put("candidatePathCount", report.candidates.size)
@@ -40,6 +48,12 @@ object CameraDiagnostics {
             put("verifiedRawLensCount", report.visibleLenses.count { it.rawUsable })
             put("ndkOnlyDirectCount", report.discovery.ndkDirectIds.count {
                 it !in report.discovery.javaDirectIds
+            })
+            put("hiddenMetadataValidCount", report.discovery.hiddenMetadataIds.size)
+            put("hiddenDiscoveredCount", report.discovery.hiddenDiscoveredIds.size)
+            put("hiddenLogicalCameraCount", report.discovery.hiddenLogicalTopology.size)
+            put("hiddenVisibleLensCount", report.visibleLenses.count {
+                CameraDiscoverySource.HIDDEN_ID_PROBE in it.discoverySources
             })
             put("nativePreviewQualifiedCount", report.candidates.count {
                 it.accessPath == CameraAccessPath.NDK_DIRECT && it.qualification.previewSessionQualified
@@ -54,6 +68,8 @@ object CameraDiagnostics {
                     put("cameraId", lens.cameraId)
                     put("displayName", lens.displayName)
                     put("accessPath", lens.accessPath.name)
+                    put("discoverySources", stringArray(lens.discoverySources.map { it.name }.sorted()))
+                    put("hiddenDiscovered", CameraDiscoverySource.HIDDEN_ID_PROBE in lens.discoverySources)
                     put("renderMode", renderMode(lens))
                     put("horizontalFovDegrees", lens.horizontalFovDegrees ?: JSONObject.NULL)
                 })
@@ -71,6 +87,7 @@ object CameraDiagnostics {
         put("physicalCameraId", lens.physicalCameraId ?: JSONObject.NULL)
         put("accessPath", lens.accessPath.name)
         put("discoverySources", stringArray(lens.discoverySources.map { it.name }.sorted()))
+        put("hiddenDiscovered", CameraDiscoverySource.HIDDEN_ID_PROBE in lens.discoverySources)
         put("displayName", lens.displayName)
         put("facing", facingLabel(lens.facing))
         put("focalLengthMm", lens.focalLengthMm ?: JSONObject.NULL)
@@ -113,6 +130,12 @@ object CameraDiagnostics {
         lens.qualification.yuvSessionQualified -> "CAMERA2_YUV_CPU"
         lens.qualification.rawSessionQualified -> "RAW_DIAGNOSTIC_ONLY"
         else -> "NONE"
+    }
+
+    private fun topologyJson(topology: Map<String, List<String>>): JSONObject = JSONObject().apply {
+        topology.forEach { (logicalId, physicalIds) ->
+            put(logicalId, stringArray(physicalIds))
+        }
     }
 
     private fun sizeJson(size: android.util.Size): JSONObject = JSONObject()
