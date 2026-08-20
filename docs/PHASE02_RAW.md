@@ -38,8 +38,10 @@ Phase 02B will replace that temporary hand-off with simultaneous preview + RAW m
 
 ## Storage during development
 
-Hardware-qualification files are written to the app external files area under:
+On Android 10+, completed AURAW source records are published through `MediaStore.Files` under the user-visible path:
 
-`Pictures/Aurora/RAW/`
+`Documents/Aurora/RAW/`
 
-This requires no broad storage permission and keeps Phase 02 focused on sensor correctness before gallery/export UX.
+AURAW is a generic canonical source record (`application/octet-stream`), not a rendered image, so scoped storage does not permit it under the `Pictures` primary directory through `MediaStore.Files`. Rendered/export formats such as JPEG or DNG can use image-oriented public collections later without changing the canonical AURAW contract.
+
+Android 9 keeps the conservative app-specific external-files fallback so Phase 02 does not request legacy broad storage permission.
