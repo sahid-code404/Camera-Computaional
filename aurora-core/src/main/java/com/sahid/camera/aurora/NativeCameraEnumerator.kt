@@ -14,6 +14,8 @@ data class NativeCameraInfo(
     val hardwareLevel: Int?,
     val facing: Int?,
     val focalLengthMm: Float?,
+    val sensorWidthMm: Float?,
+    val sensorHeightMm: Float?,
     val rawCapability: Boolean,
     val privateOutputSizes: List<NativeCameraSize>,
     val yuvOutputSizes: List<NativeCameraSize>,
@@ -57,6 +59,8 @@ object NativeCameraEnumerator {
                         hardwareLevel = item.optNullableInt("hardwareLevel"),
                         facing = item.optNullableInt("facing"),
                         focalLengthMm = item.optNullableDouble("focalLengthMm")?.toFloat(),
+                        sensorWidthMm = item.optNullableDouble("sensorWidthMm")?.toFloat(),
+                        sensorHeightMm = item.optNullableDouble("sensorHeightMm")?.toFloat(),
                         rawCapability = item.optBoolean("rawCapability", false),
                         privateOutputSizes = item.optSizeArray("privateOutputSizes"),
                         yuvOutputSizes = item.optSizeArray("yuvOutputSizes"),
@@ -67,7 +71,7 @@ object NativeCameraEnumerator {
         }
     }.getOrDefault(emptyList())
 
-    /** Opens the exact ID through ACameraManager and immediately closes it again. */
+    /** Diagnostic-only exact-ID open probe. Real NDK sessions use [NativeCameraSession]. */
     fun probeDirectOpen(cameraId: String): NativeCameraOpenProbe =
         NativeCameraOpenProbe(cameraId, nativeProbeDirectOpen(cameraId))
 
