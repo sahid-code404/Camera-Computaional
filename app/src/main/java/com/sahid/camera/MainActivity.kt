@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.view.TextureView
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -158,6 +159,7 @@ private fun CameraScreen() {
             }
         )
     }
+    var lastRawResult by remember { mutableStateOf<String?>(null) }
     var lensScanBusy by remember { mutableStateOf(false) }
     var rawCaptureBusy by remember { mutableStateOf(false) }
     var autoDiscoveryBusy by remember { mutableStateOf(false) }
@@ -368,12 +370,28 @@ private fun CameraScreen() {
                     .padding(6.dp)
                     .clip(CircleShape)
                     .background(if (rawAvailable && !rawCaptureBusy) Color.White else Color.DarkGray)
-                    .clickable(enabled = rawAvailable && !rawCaptureBusy) {
-                        val selectedFamilyLens = selectedLens ?: return@clickable
-                        val captureRoute = rawRoute ?: return@clickable
+                    .clickable(enabled = !rawCaptureBusy) {
+                        val selectedFamilyLens = selectedLens
+                        if (selectedFamilyLens == null) {
+                            val message = "RAW unavailable • no lens selected"
+                            status = message
+                            lastRawResult = message
+                            Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+                            return@clickable
+                        }
+                        val captureRoute = rawRoute
+                        if (captureRoute == null) {
+                            val message = "RAW unavailable • ${selectedFamilyLens.displayName} has no RAW_SENSOR family profile"
+                            status = message
+                            lastRawResult = message
+                            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                            return@clickable
+                        }
+
                         scope.launch {
                             rawCaptureBusy = true
                             selectedLens = null
+                            lastRawResult = "RAW capture started • ${captureRoute.accessPath.name}"
                             status = if (captureRoute.stableId == selectedFamilyLens.stableId) {
                                 "Capturing canonical RAW_SENSOR…"
                             } else {
@@ -386,10 +404,24 @@ private fun CameraScreen() {
                                 }) {
                                     is RawCaptureOutcome.Success -> {
                                         val record = outcome.record
-                                        status = "RAW saved • ${record.width}×${record.height} • ${record.file.name}"
+                                        val location = record.file.path.removePrefix("/")
+                                        val message = "RAW saved • ${record.width}×${record.height} • $location"
+                                        status = message
+                                        lastRawResult = message
+                                        Toast.makeText(context, "RAW saved\n$location", Toast.LENGTH_LONG).show()
                                     }
-                                    is RawCaptureOutcome.Unsupported -> status = outcome.reason
-                                    is RawCaptureOutcome.Failure -> status = "RAW failed • ${outcome.reason}"
+                                    is RawCaptureOutcome.Unsupported -> {
+                                        val message = "RAW unsupported • ${outcome.reason}"
+                                        status = message
+                                        lastRawResult = message
+                                        Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                                    }
+                                    is RawCaptureOutcome.Failure -> {
+                                        val message = "RAW failed • ${outcome.reason}"
+                                        status = message
+                                        lastRawResult = message
+                                        Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                                    }
                                 }
                             } finally {
                                 selectedLens = lenses.firstOrNull { it.stableId == selectedFamilyLens.stableId }
@@ -410,11 +442,19 @@ private fun CameraScreen() {
                     autoDiscoveryBusy -> "Preview live • finding useful extra lenses in background…"
                     bootstrap.backgroundDiscoveryNeeded && !autoDiscoveryStarted ->
                         "Preview first • lens discovery waits for first real frame"
-                    else -> "RAW unavailable on selected lens family"
+                    else -> "RAW unavailable on selected lens family • tap shutter for reason"
                 },
                 color = Color.Gray,
                 fontSize = 10.sp,
             )
+            lastRawResult?.let { result ->
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    result,
+                    color = if (result.startsWith("RAW saved")) Color.White else Color.LightGray,
+                    fontSize = 10.sp,
+                )
+            }
         }
     }
 }
