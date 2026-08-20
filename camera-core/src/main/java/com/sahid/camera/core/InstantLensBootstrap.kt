@@ -11,12 +11,12 @@ import kotlin.math.atan
 /**
  * Zero-scan startup path.
  *
- * With a learned map this reads SharedPreferences only. Useful metadata candidates discovered on a
- * previous launch are restored from a separate candidate cache, so additional lenses do not need to
- * be rediscovered before appearing again. Frame-proven routes always outrank candidate routes.
+ * With a learned map this reads SharedPreferences only. Useful metadata profiles discovered on a
+ * previous launch are restored from a separate candidate cache and collapsed into lens families;
+ * aliases remain in the cache but only each family's default route reaches the normal selector.
  *
  * On a brand-new ROM/install it does the minimum public Camera2 work necessary to start one usable
- * rear camera; ProgressiveLensDiscovery fills the remaining map after preview startup.
+ * rear camera; ProgressiveLensDiscovery fills the remaining family map after preview startup.
  */
 data class InstantLensBootstrapResult(
     val lenses: List<LensCapability>,
@@ -31,7 +31,7 @@ object InstantLensBootstrap {
 
         if (learned.isNotEmpty()) {
             return InstantLensBootstrapResult(
-                lenses = LensValueFilter.filterForSelector(learned + readyCandidates),
+                lenses = LensFamilyResolver.defaultsForSelector(learned + readyCandidates),
                 learned = true,
             )
         }
@@ -39,7 +39,7 @@ object InstantLensBootstrap {
         val primaryHint = findPrimaryPublicHint(appContext)
         if (readyCandidates.isNotEmpty()) {
             return InstantLensBootstrapResult(
-                lenses = LensValueFilter.filterForSelector(listOfNotNull(primaryHint) + readyCandidates),
+                lenses = LensFamilyResolver.defaultsForSelector(listOfNotNull(primaryHint) + readyCandidates),
                 learned = false,
             )
         }
@@ -117,6 +117,7 @@ object InstantLensBootstrap {
             burstCapture = CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_BURST_CAPTURE in capabilities,
             maxResolutionSensor = CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_ULTRA_HIGH_RESOLUTION_SENSOR in capabilities,
             isLogicalMultiCamera = chars.physicalCameraIds.isNotEmpty(),
+            logicalPhysicalIds = chars.physicalCameraIds,
             usableForPreview = true,
             qualification = LensQualification(
                 accessPathOpenQualified = false,
