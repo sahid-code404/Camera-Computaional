@@ -5,6 +5,7 @@ add_library(
     aurora_core
     SHARED
     aurora_jni.cpp
+    hidden_camera_discovery.cpp
 )
 
 target_compile_features(aurora_core PRIVATE cxx_std_20)
