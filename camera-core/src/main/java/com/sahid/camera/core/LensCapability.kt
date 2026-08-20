@@ -17,6 +17,8 @@ enum class CameraDiscoverySource {
     DEEP_OPEN_PROBE,
     /** Cheap background metadata candidate; first live frame still proves the route. */
     AUTO_METADATA,
+    /** Persisted metadata candidate. It is remembered across launches but is not frame-proven. */
+    CANDIDATE_CACHE,
     /** Per-build route learned from a previous real-frame qualification. */
     LEARNED_CACHE,
 }
@@ -75,10 +77,13 @@ data class LensCapability(
     val automaticMetadataCandidate: Boolean
         get() = CameraDiscoverySource.AUTO_METADATA in discoverySources
 
+    val persistedCandidate: Boolean
+        get() = CameraDiscoverySource.CANDIDATE_CACHE in discoverySources
+
     /**
      * The live controller can render PRIVATE or YUV routes. For automatic metadata candidates,
-     * these flags are optimistic stream hints only; the candidate is persisted only after an
-     * actual TextureView/ImageReader frame is observed.
+     * these flags are optimistic stream hints only; the candidate is persisted as proven only
+     * after an actual TextureView/ImageReader frame is observed.
      */
     val userVisible: Boolean
         get() = qualification.previewSessionQualified || qualification.yuvSessionQualified
