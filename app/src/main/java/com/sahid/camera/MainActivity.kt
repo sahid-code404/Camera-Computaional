@@ -52,6 +52,7 @@ import com.sahid.camera.aurora.AuroraNative
 import com.sahid.camera.core.CameraAccessPath
 import com.sahid.camera.core.CameraCapabilityProbe
 import com.sahid.camera.core.CameraDiagnostics
+import com.sahid.camera.core.CameraDiscoverySource
 import com.sahid.camera.core.CameraPreviewController
 import com.sahid.camera.core.LensCapability
 import com.sahid.camera.ui.CameraTheme
@@ -113,7 +114,7 @@ private fun PermissionScreen(onGrant: () -> Unit) {
             Text("Camera permission is required", color = Color.White, fontSize = 20.sp)
             Spacer(Modifier.height(16.dp))
             Text(
-                "Phase 01 compares Java Camera2, NDK Camera2, and logical physical-camera topology before runtime qualification.",
+                "Phase 01 compares advertised Java/NDK cameras, logical topology, and a bounded hidden-ID scan before real-frame qualification.",
                 color = Color.LightGray,
             )
             Spacer(Modifier.height(24.dp))
@@ -129,7 +130,7 @@ private fun CameraScreen() {
     var lenses by remember { mutableStateOf<List<LensCapability>>(emptyList()) }
     var selectedLens by remember { mutableStateOf<LensCapability?>(null) }
     var diagnosticsJson by remember { mutableStateOf<String?>(null) }
-    var status by remember { mutableStateOf("Comparing Java + NDK + logical camera discovery…") }
+    var status by remember { mutableStateOf("Searching Java + NDK + logical + hidden IDs 0–255…") }
     var otaResult by remember { mutableStateOf<OtaCheckResult?>(null) }
     var otaBusy by remember { mutableStateOf(false) }
     var otaMessage by remember { mutableStateOf("Checking OTA…") }
@@ -152,21 +153,23 @@ private fun CameraScreen() {
             append(report.discovery.javaDirectIds.size)
             append(" • NDK ")
             append(report.discovery.ndkDirectIds.size)
+            append(" • hidden ")
+            append(report.discovery.hiddenDiscoveredIds.size)
             append(" • qualified ")
             append(report.visibleLenses.size)
             append('/')
             append(report.candidates.map { it.cameraId }.distinct().size)
+            val hiddenVisible = report.visibleLenses.count {
+                CameraDiscoverySource.HIDDEN_ID_PROBE in it.discoverySources
+            }
+            if (hiddenVisible > 0) {
+                append(" • hidden-live ")
+                append(hiddenVisible)
+            }
             val nativeVisible = report.visibleLenses.count { it.accessPath == CameraAccessPath.NDK_DIRECT }
             if (nativeVisible > 0) {
                 append(" • native ")
                 append(nativeVisible)
-            }
-            val ndkOnly = report.discovery.ndkDirectIds.count {
-                it !in report.discovery.javaDirectIds
-            }
-            if (ndkOnly > 0) {
-                append(" • NDK-only ")
-                append(ndkOnly)
             }
         }
     }
@@ -287,7 +290,7 @@ private fun CameraScreen() {
             )
             Spacer(Modifier.height(6.dp))
             Text(
-                "Surface, native-NDK, and YUV-qualified lenses are shown • RAW-only stays diagnostic",
+                "Advertised + hidden-ID candidates require real Surface/YUV frames • RAW-only stays diagnostic",
                 color = Color.Gray,
                 fontSize = 10.sp,
             )
@@ -308,14 +311,20 @@ private fun LensSelector(
         items(lenses, key = { it.stableId }) { lens ->
             val isSelected = selected?.stableId == lens.stableId
             val qualifiedRaw = lens.qualification.qualifiedRawSize
-            val previewLabel = when {
-                lens.accessPath == CameraAccessPath.NDK_DIRECT && lens.qualification.previewSessionQualified ->
-                    "NDK preview"
-                lens.qualification.previewSessionQualified -> "Camera2 preview"
-                lens.accessPath == CameraAccessPath.NDK_DIRECT && lens.qualification.yuvSessionQualified ->
-                    "NDK YUV"
-                lens.qualification.yuvSessionQualified -> "YUV preview"
-                else -> "Diagnostic only"
+            val hidden = CameraDiscoverySource.HIDDEN_ID_PROBE in lens.discoverySources
+            val previewLabel = buildString {
+                if (hidden) append("Hidden • ")
+                append(
+                    when {
+                        lens.accessPath == CameraAccessPath.NDK_DIRECT && lens.qualification.previewSessionQualified ->
+                            "NDK preview"
+                        lens.qualification.previewSessionQualified -> "Camera2 preview"
+                        lens.accessPath == CameraAccessPath.NDK_DIRECT && lens.qualification.yuvSessionQualified ->
+                            "NDK YUV"
+                        lens.qualification.yuvSessionQualified -> "YUV preview"
+                        else -> "Diagnostic only"
+                    }
+                )
             }
             Column(
                 modifier = Modifier
