@@ -27,6 +27,9 @@ data class LensCapability(
     val facing: Int?,
     val displayName: String,
     val focalLengthMm: Float?,
+    val sensorWidthMm: Float?,
+    val sensorHeightMm: Float?,
+    val horizontalFovDegrees: Float?,
     val rawSupported: Boolean,
     val rawSizes: List<Size>,
     val previewSizes: List<Size>,
@@ -57,9 +60,13 @@ data class LensCapability(
     val isFrontFacing: Boolean
         get() = facing == CameraCharacteristics.LENS_FACING_FRONT
 
-    /** Normal UI requires a real preview session, not merely promising metadata. */
+    /**
+     * A lens is visible only when Camera has a renderer for the qualified output.
+     * Surface/PRIVATE preview is preferred; YUV has an explicit CPU fallback renderer.
+     * RAW-only evidence remains diagnostic until Aurora's RAW preview renderer lands.
+     */
     val userVisible: Boolean
-        get() = qualification.previewSessionQualified
+        get() = qualification.previewSessionQualified || qualification.yuvSessionQualified
 
     val rawUsable: Boolean
         get() = rawSupported && qualification.rawSessionQualified
