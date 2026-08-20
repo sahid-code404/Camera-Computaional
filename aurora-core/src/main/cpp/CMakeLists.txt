@@ -7,6 +7,7 @@ add_library(
     aurora_jni.cpp
     hidden_camera_discovery.cpp
     auto_hidden_metadata.cpp
+    raw_capture_session.cpp
 )
 
 target_compile_features(aurora_core PRIVATE cxx_std_20)

@@ -1,6 +1,7 @@
 package com.sahid.camera.aurora
 
 import android.view.Surface
+import java.util.concurrent.ConcurrentHashMap
 
 data class NativeSessionStart(
     val handle: Long,
@@ -30,14 +31,15 @@ data class NativeSessionStart(
 /**
  * Genuine NDK-direct Camera2 session path.
  *
- * Unlike the older preflight-only probe, this keeps ACameraManager -> ACameraDevice ->
- * ACameraCaptureSession -> ACaptureRequest native from open through request submission.
- * The supplied Android Surface is converted to ANativeWindow in C++ and used as the
- * actual camera output target.
+ * Preview remains on the original lightweight native session. Phase 02 one-shot RAW capture is
+ * routed through [NativeRawCaptureSession], which retains the completed NDK CaptureResult metadata
+ * until Kotlin has timestamp-matched it with the RAW ImageReader buffer.
  */
 object NativeCameraSession {
     const val TEMPLATE_PREVIEW = 1
     const val TEMPLATE_STILL_CAPTURE = 2
+
+    private val rawHandles = ConcurrentHashMap.newKeySet<Long>()
 
     init {
         System.loadLibrary("aurora_core")
@@ -47,10 +49,20 @@ object NativeCameraSession {
         start(cameraId, surface, TEMPLATE_PREVIEW, repeating = true)
 
     fun startSingleCapture(cameraId: String, surface: Surface): NativeSessionStart =
-        start(cameraId, surface, TEMPLATE_STILL_CAPTURE, repeating = false)
+        NativeRawCaptureSession.start(cameraId, surface).also { result ->
+            if (result.started) rawHandles.add(result.handle)
+        }
+
+    fun captureMetadataJson(handle: Long): String? =
+        if (handle in rawHandles) NativeRawCaptureSession.captureMetadataJson(handle) else null
 
     fun stop(handle: Long) {
-        if (handle != 0L) nativeStopSession(handle)
+        if (handle == 0L) return
+        if (rawHandles.remove(handle)) {
+            NativeRawCaptureSession.stop(handle)
+        } else {
+            nativeStopSession(handle)
+        }
     }
 
     private fun start(

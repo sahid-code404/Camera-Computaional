@@ -5,7 +5,7 @@ plugins {
 }
 
 val otaVersionCode = System.getenv("CAMERA_VERSION_CODE")?.toIntOrNull() ?: 1
-val otaVersionName = System.getenv("CAMERA_VERSION_NAME") ?: "0.1.0-phase01-dev"
+val otaVersionName = System.getenv("CAMERA_VERSION_NAME") ?: "0.2.0-phase02-dev"
 
 android {
     namespace = "com.sahid.camera"
@@ -22,7 +22,7 @@ android {
         buildConfigField(
             "String",
             "OTA_MANIFEST_URL",
-            "\"https://github.com/sahid-code404/Camera-Computaional/releases/download/phase01-latest/update.json\"",
+            "\"https://github.com/sahid-code404/Camera-Computaional/releases/download/phase02-latest/update.json\"",
         )
     }
 

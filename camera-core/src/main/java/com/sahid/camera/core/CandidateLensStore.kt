@@ -9,15 +9,9 @@ import org.json.JSONObject
 /**
  * Per-ROM cache for useful metadata-discovered camera routes that have not produced a real frame.
  *
- * Important: this store keeps every endpoint/profile, including aliases that are hidden by the
- * normal selector. [LensFamilyResolver] decides which route is the default for each user-facing lens
- * family. Keeping aliases here means restart never destroys alternate routes that may later be
- * useful as compatibility fallbacks.
- *
- * The cache is also tied to [LensFamilyPolicy.CLASSIFIER_VERSION]. A ROM fingerprint can stay the
- * same across app updates while Aurora's family semantics improve; stale metadata decisions must not
- * survive that change. Learned routes are stored separately and remain valid because they have
- * actual-frame evidence.
+ * Important: this store keeps every endpoint/profile, including aliases hidden by the normal
+ * selector and RAW-only physical routes that cannot render a preview. Selector visibility and RAW
+ * capture eligibility are deliberately separate concerns.
  */
 class CandidateLensStore(context: Context) {
     private val prefs = context.applicationContext
@@ -30,15 +24,14 @@ class CandidateLensStore(context: Context) {
 
     fun load(): List<LensCapability> = loadSnapshot().routes
 
-    /**
-     * A completed automatic metadata pass is valid only for the current Build.FINGERPRINT and the
-     * current family-classifier version.
-     */
     fun hasCompletedAutoScan(): Boolean = loadSnapshot().autoScanCompleted
 
     fun replace(routes: List<LensCapability>, autoScanCompleted: Boolean = true) {
         val retained = routes
-            .filter { it.userVisible && !it.learnedFromCache }
+            .filter { route ->
+                !route.learnedFromCache &&
+                    (route.userVisible || (route.rawSupported && route.rawSizes.isNotEmpty()))
+            }
             .map { route ->
                 route.copy(
                     discoverySources = (route.discoverySources - CameraDiscoverySource.LEARNED_CACHE) +
@@ -90,7 +83,7 @@ class CandidateLensStore(context: Context) {
 
     private fun save(routes: List<LensCapability>, autoScanCompleted: Boolean) {
         val payload = JSONObject()
-            .put("schemaVersion", 3)
+            .put("schemaVersion", 4)
             .put("classifierVersion", LensFamilyPolicy.CLASSIFIER_VERSION)
             .put("buildFingerprint", Build.FINGERPRINT)
             .put("savedAtUnixMs", System.currentTimeMillis())
@@ -143,8 +136,8 @@ class CandidateLensStore(context: Context) {
             }.getOrNull() ?: continue
             val previewSizes = item.optSizeArray("previewSizes")
             val yuvSizes = item.optSizeArray("yuvSizes")
-            if (previewSizes.isEmpty() && yuvSizes.isEmpty()) continue
             val rawSizes = item.optSizeArray("rawSizes")
+            if (previewSizes.isEmpty() && yuvSizes.isEmpty() && rawSizes.isEmpty()) continue
             val sources = buildSet {
                 val array = item.optJSONArray("discoverySources")
                 if (array != null) {
@@ -172,7 +165,7 @@ class CandidateLensStore(context: Context) {
                     sensorWidthMm = item.optNullableDouble("sensorWidthMm")?.toFloat(),
                     sensorHeightMm = item.optNullableDouble("sensorHeightMm")?.toFloat(),
                     horizontalFovDegrees = item.optNullableDouble("horizontalFovDegrees")?.toFloat(),
-                    rawSupported = item.optBoolean("rawSupported", false),
+                    rawSupported = item.optBoolean("rawSupported", rawSizes.isNotEmpty()),
                     rawSizes = rawSizes,
                     previewSizes = previewSizes,
                     yuvSizes = yuvSizes,
@@ -181,7 +174,7 @@ class CandidateLensStore(context: Context) {
                     maxResolutionSensor = item.optBoolean("maxResolutionSensor", false),
                     isLogicalMultiCamera = item.optBoolean("logicalMultiCamera", false),
                     logicalPhysicalIds = item.optStringSet("logicalPhysicalIds"),
-                    usableForPreview = true,
+                    usableForPreview = previewSizes.isNotEmpty() || yuvSizes.isNotEmpty(),
                     nativeHardwareLevel = item.optNullableInt("nativeHardwareLevel"),
                     nativeCharacteristicsStatus = item.optNullableInt("nativeCharacteristicsStatus"),
                     qualification = LensQualification(
@@ -190,7 +183,11 @@ class CandidateLensStore(context: Context) {
                         yuvSessionQualified = yuvHint,
                         rawSessionQualified = false,
                         qualifiedRawSize = null,
-                        detail = "Persistent metadata profile; first live frame still proves route",
+                        detail = if (previewSizes.isEmpty() && yuvSizes.isEmpty()) {
+                            "Persistent RAW-only metadata profile"
+                        } else {
+                            "Persistent metadata profile; first live frame still proves route"
+                        },
                     ),
                 )
             )
@@ -204,8 +201,9 @@ class CandidateLensStore(context: Context) {
         if (lens.horizontalFovDegrees != null) score += 2
         if (lens.previewSizes.isNotEmpty()) score += 3
         if (lens.yuvSizes.isNotEmpty()) score += 2
-        if (lens.rawSizes.isNotEmpty()) score += 1
+        if (lens.rawSizes.isNotEmpty()) score += 5
         if (lens.logicalPhysicalIds.isNotEmpty()) score += 3
+        if (lens.accessPath == CameraAccessPath.PHYSICAL_VIA_LOGICAL) score += 4
         return score
     }
 

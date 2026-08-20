@@ -4,7 +4,9 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.view.MotionEvent
 import android.view.TextureView
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -55,10 +57,14 @@ import com.sahid.camera.core.CameraCapabilityProbe
 import com.sahid.camera.core.CameraDiagnostics
 import com.sahid.camera.core.CameraDiscoverySource
 import com.sahid.camera.core.CameraPreviewController
+import com.sahid.camera.core.FocusMeteringPoint
 import com.sahid.camera.core.InstantLensBootstrap
 import com.sahid.camera.core.LensCapability
 import com.sahid.camera.core.LensValueFilter
 import com.sahid.camera.core.ProgressiveLensDiscovery
+import com.sahid.camera.core.RawCaptureOutcome
+import com.sahid.camera.core.RawRouteResolver
+import com.sahid.camera.core.SingleRawCaptureEngine
 import com.sahid.camera.ui.CameraTheme
 import com.sahid.camera.update.OtaCheckResult
 import com.sahid.camera.update.OtaUpdateManager
@@ -132,9 +138,8 @@ private fun PermissionScreen(onGrant: () -> Unit) {
 private fun CameraScreen() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val rawRouteResolver = remember { RawRouteResolver(context) }
 
-    // The hot path is intentionally tiny. A learned ROM reads only SharedPreferences; a fresh ROM
-    // performs only enough standard Java advertised metadata work to start the primary preview.
     val bootstrap = remember { InstantLensBootstrap.load(context) }
     var lenses by remember { mutableStateOf(bootstrap.lenses) }
     var selectedLens by remember {
@@ -156,13 +161,16 @@ private fun CameraScreen() {
             }
         )
     }
+    var lastRawResult by remember { mutableStateOf<String?>(null) }
     var lensScanBusy by remember { mutableStateOf(false) }
+    var rawCaptureBusy by remember { mutableStateOf(false) }
     var autoDiscoveryBusy by remember { mutableStateOf(false) }
     var autoDiscoveryStarted by remember { mutableStateOf(false) }
     var firstPreviewFrameSeen by remember { mutableStateOf(false) }
     var otaResult by remember { mutableStateOf<OtaCheckResult?>(null) }
     var otaBusy by remember { mutableStateOf(false) }
     var otaMessage by remember { mutableStateOf("Checking OTA…") }
+    var focusPointsByCameraId by remember { mutableStateOf<Map<String, FocusMeteringPoint>>(emptyMap()) }
     val nativeStatus = remember {
         runCatching {
             "Aurora ${AuroraNative.version()} • native self-test ${if (AuroraNative.selfTest()) "OK" else "FAILED"}"
@@ -198,13 +206,8 @@ private fun CameraScreen() {
         }
     }
 
-    // Fast phones start discovery immediately after their first real preview frame. This avoids a
-    // fixed timer racing CameraService on slower OEMs. A safety timeout prevents a broken primary
-    // route from blocking discovery forever; if no public hint exists we start immediately.
     LaunchedEffect(firstPreviewFrameSeen, bootstrap.backgroundDiscoveryNeeded) {
-        if (firstPreviewFrameSeen) {
-            runAutomaticDiscoveryIfNeeded()
-        }
+        if (firstPreviewFrameSeen) runAutomaticDiscoveryIfNeeded()
     }
     LaunchedEffect(Unit) {
         if (!bootstrap.backgroundDiscoveryNeeded) return@LaunchedEffect
@@ -212,7 +215,6 @@ private fun CameraScreen() {
         runAutomaticDiscoveryIfNeeded()
     }
 
-    // OTA/network work is independent of camera startup and never triggers camera discovery.
     LaunchedEffect(Unit) {
         otaBusy = true
         otaResult = OtaUpdateManager.checkForUpdate().also { result ->
@@ -230,6 +232,9 @@ private fun CameraScreen() {
             CameraPreview(
                 lens = lens,
                 onStatus = { status = it },
+                onFocusPoint = { point ->
+                    focusPointsByCameraId = focusPointsByCameraId + (lens.cameraId to point)
+                },
                 onRouteProven = { proven ->
                     firstPreviewFrameSeen = true
                     val previousStableId = selectedLens?.stableId
@@ -256,7 +261,7 @@ private fun CameraScreen() {
                 .background(Color(0x66000000))
                 .padding(horizontal = 16.dp, vertical = 14.dp),
         ) {
-            Text("Camera • Aurora Phase 01", color = Color.White, fontSize = 16.sp)
+            Text("Camera • Aurora Phase 02", color = Color.White, fontSize = 16.sp)
             Text(status, color = Color.LightGray, fontSize = 12.sp)
             Text(nativeStatus, color = Color.Gray, fontSize = 11.sp)
             Text(
@@ -274,7 +279,7 @@ private fun CameraScreen() {
                 .padding(top = 12.dp, bottom = 22.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            LensSelector(lenses, selectedLens) { selectedLens = it }
+            LensSelector(lenses, selectedLens) { if (!rawCaptureBusy) selectedLens = it }
             Spacer(Modifier.height(12.dp))
             ModeRow()
             Spacer(Modifier.height(10.dp))
@@ -285,10 +290,8 @@ private fun CameraScreen() {
                     }
                 }
 
-                // Advanced fallback only. Normal discovery is automatic; deep rescan retains
-                // direct-open probing for OEMs that hide the camera even from metadata lookup.
                 Button(
-                    enabled = !lensScanBusy,
+                    enabled = !lensScanBusy && !rawCaptureBusy,
                     onClick = {
                         scope.launch {
                             lensScanBusy = true
@@ -314,7 +317,7 @@ private fun CameraScreen() {
                 }
 
                 Button(
-                    enabled = !otaBusy,
+                    enabled = !otaBusy && !rawCaptureBusy,
                     onClick = {
                         val current = otaResult
                         if (current is OtaCheckResult.Available) {
@@ -362,26 +365,106 @@ private fun CameraScreen() {
                 }
             }
             Spacer(Modifier.height(10.dp))
+
+            val familyLens = selectedLens
+            val rawRoute = familyLens?.let(rawRouteResolver::resolve)
+            val rawAvailable = rawRoute != null
             Box(
                 modifier = Modifier
                     .size(76.dp)
-                    .border(4.dp, Color.White, CircleShape)
+                    .border(4.dp, if (rawAvailable) Color.White else Color.Gray, CircleShape)
                     .padding(6.dp)
                     .clip(CircleShape)
-                    .background(Color.White),
+                    .background(if (rawAvailable && !rawCaptureBusy) Color.White else Color.DarkGray)
+                    .clickable(enabled = !rawCaptureBusy) {
+                        val selectedFamilyLens = selectedLens
+                        if (selectedFamilyLens == null) {
+                            val message = "RAW unavailable • no lens selected"
+                            status = message
+                            lastRawResult = message
+                            Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+                            return@clickable
+                        }
+                        val captureRoute = rawRoute
+                        if (captureRoute == null) {
+                            val message = "RAW unavailable • ${selectedFamilyLens.displayName} has no RAW_SENSOR family profile"
+                            status = message
+                            lastRawResult = message
+                            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                            return@clickable
+                        }
+                        val requestedFocusPoint = focusPointsByCameraId[selectedFamilyLens.cameraId]
+
+                        scope.launch {
+                            rawCaptureBusy = true
+                            selectedLens = null
+                            lastRawResult = "RAW capture started • ${captureRoute.accessPath.name}"
+                            status = if (captureRoute.stableId == selectedFamilyLens.stableId) {
+                                "Capturing canonical RAW_SENSOR…"
+                            } else {
+                                "Capturing RAW via ${captureRoute.accessPath.name} family profile…"
+                            }
+                            try {
+                                delay(RAW_PREVIEW_RELEASE_DELAY_MS)
+                                when (val outcome = withContext(Dispatchers.IO) {
+                                    SingleRawCaptureEngine(context).capture(
+                                        lens = captureRoute,
+                                        focusPoint = requestedFocusPoint,
+                                    )
+                                }) {
+                                    is RawCaptureOutcome.Success -> {
+                                        val record = outcome.record
+                                        val location = record.file.path.removePrefix("/")
+                                        val message = "RAW saved • ${record.width}×${record.height} • $location"
+                                        status = message
+                                        lastRawResult = message
+                                        Toast.makeText(context, "RAW saved\n$location", Toast.LENGTH_LONG).show()
+                                    }
+                                    is RawCaptureOutcome.Unsupported -> {
+                                        val message = "RAW unsupported • ${outcome.reason}"
+                                        status = message
+                                        lastRawResult = message
+                                        Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                                    }
+                                    is RawCaptureOutcome.Failure -> {
+                                        val message = "RAW failed • ${outcome.reason}"
+                                        status = message
+                                        lastRawResult = message
+                                        Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                                    }
+                                }
+                            } finally {
+                                selectedLens = lenses.firstOrNull { it.stableId == selectedFamilyLens.stableId }
+                                    ?: lenses.firstOrNull { it.cameraId == selectedFamilyLens.cameraId }
+                                    ?: selectedFamilyLens
+                                rawCaptureBusy = false
+                            }
+                        }
+                    },
             )
             Spacer(Modifier.height(6.dp))
             Text(
-                if (autoDiscoveryBusy) {
-                    "Preview live • finding useful extra lenses in background…"
-                } else if (bootstrap.backgroundDiscoveryNeeded && !autoDiscoveryStarted) {
-                    "Preview first • lens discovery waits for first real frame"
-                } else {
-                    "Instant preview • useful lens cache • helper aliases hidden automatically"
+                when {
+                    rawCaptureBusy -> "RAW_SENSOR capture • autofocus lock + image/metadata pairing…"
+                    rawAvailable && rawRoute?.stableId != familyLens?.stableId ->
+                        "Phase 02A • RAW available through internal family profile"
+                    rawAvailable -> "Phase 02A • canonical RAW_SENSOR ready • tap preview to focus"
+                    autoDiscoveryBusy -> "Preview live • finding useful extra lenses in background…"
+                    bootstrap.backgroundDiscoveryNeeded && !autoDiscoveryStarted ->
+                        "Preview first • lens discovery waits for first real frame"
+                    else -> "RAW unavailable on selected lens family • tap shutter for reason"
                 },
                 color = Color.Gray,
                 fontSize = 10.sp,
             )
+            lastRawResult?.let { result ->
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    result,
+                    color = if (result.startsWith("RAW saved")) Color.White else Color.LightGray,
+                    fontSize = 10.sp,
+                )
+            }
         }
     }
 }
@@ -398,7 +481,6 @@ private fun LensSelector(
     ) {
         items(lenses, key = { it.stableId }) { lens ->
             val isSelected = selected?.stableId == lens.stableId
-            val qualifiedRaw = lens.qualification.qualifiedRawSize
             val hidden = CameraDiscoverySource.HIDDEN_ID_PROBE in lens.discoverySources
             val learned = CameraDiscoverySource.LEARNED_CACHE in lens.discoverySources
             val ready = CameraDiscoverySource.CANDIDATE_CACHE in lens.discoverySources
@@ -440,9 +522,10 @@ private fun LensSelector(
                             append(" • ")
                             append(String.format("%.1fmm", it))
                         }
-                        if (lens.rawUsable) {
+                        if (lens.rawSupported && lens.rawSizes.isNotEmpty()) {
+                            val rawSize = lens.rawSizes.maxByOrNull { it.width.toLong() * it.height.toLong() }
                             append(" • RAW")
-                            qualifiedRaw?.let { append(" ${it.width}×${it.height}") }
+                            rawSize?.let { append(" ${it.width}×${it.height}") }
                         }
                     },
                     color = if (isSelected) Color.DarkGray else Color.LightGray,
@@ -471,24 +554,42 @@ private fun CameraPreview(
     lens: LensCapability,
     onStatus: (String) -> Unit,
     onRouteProven: (LensCapability) -> Unit,
+    onFocusPoint: (FocusMeteringPoint) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val latestStatus = rememberUpdatedState(onStatus)
     val latestRouteProven = rememberUpdatedState(onRouteProven)
+    val latestFocusPoint = rememberUpdatedState(onFocusPoint)
     val controller = remember {
         CameraPreviewController(
             context = context.applicationContext,
             onStatus = { latestStatus.value(it) },
             onRouteProven = { latestRouteProven.value(it) },
+            onFocusPoint = { latestFocusPoint.value(it) },
         )
     }
 
     AndroidView(
         modifier = modifier,
         factory = { viewContext ->
-            TextureView(viewContext).also(controller::attach)
+            TextureView(viewContext).also { view ->
+                view.isClickable = true
+                view.setOnTouchListener { _, event ->
+                    when (event.actionMasked) {
+                        MotionEvent.ACTION_DOWN -> true
+                        MotionEvent.ACTION_UP -> {
+                            controller.tapToFocus(event.x, event.y)
+                            view.performClick()
+                            true
+                        }
+                        MotionEvent.ACTION_CANCEL -> true
+                        else -> true
+                    }
+                }
+                controller.attach(view)
+            }
         },
         update = {
             controller.setLens(lens)
@@ -517,10 +618,11 @@ private fun CameraPreview(
 private fun shareDiagnostics(context: Context, diagnosticsJson: String) {
     val sendIntent = Intent(Intent.ACTION_SEND).apply {
         type = "application/json"
-        putExtra(Intent.EXTRA_SUBJECT, "Camera Aurora Phase 01 diagnostics")
+        putExtra(Intent.EXTRA_SUBJECT, "Camera Aurora Phase 02 diagnostics")
         putExtra(Intent.EXTRA_TEXT, diagnosticsJson)
     }
     context.startActivity(Intent.createChooser(sendIntent, "Share Camera diagnostics"))
 }
 
 private const val AUTO_DISCOVERY_SAFETY_DELAY_MS = 1_500L
+private const val RAW_PREVIEW_RELEASE_DELAY_MS = 150L

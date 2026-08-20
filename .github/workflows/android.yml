@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 45
     env:
       CAMERA_VERSION_CODE: ${{ github.run_number }}
-      CAMERA_VERSION_NAME: "0.1.0-phase01.${{ github.run_number }}"
+      CAMERA_VERSION_NAME: "0.2.0-phase02.${{ github.run_number }}"
 
     steps:
       - name: Checkout
@@ -57,52 +57,52 @@ jobs:
       - name: Run unit tests
         run: ./gradlew --no-daemon :app:testDebugUnitTest :camera-core:testDebugUnitTest :aurora-core:testDebugUnitTest
 
-      - name: Prepare OTA payload
-        if: github.event_name == 'push' && github.ref == 'refs/heads/phase/01-foundation-discovery'
+      - name: Prepare Phase 02 OTA payload
+        if: github.event_name == 'push' && github.ref == 'refs/heads/phase/02-single-raw-capture'
         shell: bash
         run: |
           mkdir -p ota
-          cp app/build/outputs/apk/debug/app-debug.apk ota/Camera-Phase01-latest.apk
-          APK_SHA256=$(sha256sum ota/Camera-Phase01-latest.apk | awk '{print $1}')
+          cp app/build/outputs/apk/debug/app-debug.apk ota/Camera-Phase02-latest.apk
+          APK_SHA256=$(sha256sum ota/Camera-Phase02-latest.apk | awk '{print $1}')
           cat > ota/update.json <<EOF
           {
             "schemaVersion": 1,
             "packageName": "com.sahid.camera",
             "versionCode": ${CAMERA_VERSION_CODE},
             "versionName": "${CAMERA_VERSION_NAME}",
-            "apkUrl": "https://github.com/sahid-code404/Camera-Computaional/releases/download/phase01-latest/Camera-Phase01-latest.apk",
+            "apkUrl": "https://github.com/sahid-code404/Camera-Computaional/releases/download/phase02-latest/Camera-Phase02-latest.apk",
             "sha256": "${APK_SHA256}",
             "commit": "${GITHUB_SHA}"
           }
           EOF
           cat ota/update.json
 
-      - name: Publish Phase 01 OTA release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/phase/01-foundation-discovery'
+      - name: Publish Phase 02 OTA release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/phase/02-single-raw-capture'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -f phase01-latest "$GITHUB_SHA"
-          git push origin --force refs/tags/phase01-latest
+          git tag -f phase02-latest "$GITHUB_SHA"
+          git push origin --force refs/tags/phase02-latest
 
-          if ! gh release view phase01-latest >/dev/null 2>&1; then
-            gh release create phase01-latest \
+          if ! gh release view phase02-latest >/dev/null 2>&1; then
+            gh release create phase02-latest \
               --prerelease \
-              --title "Camera Phase 01 OTA" \
-              --notes "Automated signed development build for com.sahid.camera. Not a production release."
+              --title "Camera Phase 02 OTA" \
+              --notes "Automated signed Phase 02 development build for com.sahid.camera. Not a production release."
           fi
 
-          gh release upload phase01-latest \
-            ota/Camera-Phase01-latest.apk \
+          gh release upload phase02-latest \
+            ota/Camera-Phase02-latest.apk \
             ota/update.json \
             --clobber
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Camera-foundation-debug-apk
+          name: Camera-phase02-single-raw-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error

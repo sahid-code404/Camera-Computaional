@@ -30,22 +30,11 @@ import java.util.concurrent.Executor
 import kotlin.math.abs
 import kotlin.math.max
 
-/**
- * Live preview dispatcher optimized for instant cached startup.
- *
- * JAVA_DIRECT and PHYSICAL_VIA_LOGICAL use Java Camera2. NDK_DIRECT stays native all the way
- * through ACameraManager/ACameraDevice/ACameraCaptureSession. A learned Java route that becomes
- * stale is removed immediately and, for a direct camera ID, retried through NDK without forcing a
- * complete rediscovery pass. Routes are written to the learned cache only after a live frame is
- * observed by TextureView or ImageReader.
- *
- * Real-frame proof is also emitted to the UI immediately, eliminating SharedPreferences polling and
- * allowing progressive discovery to wait for first preview instead of competing with camera startup.
- */
 class CameraPreviewController(
     private val context: Context,
     private val onStatus: (String) -> Unit = {},
     private val onRouteProven: (LensCapability) -> Unit = {},
+    private val onFocusPoint: (FocusMeteringPoint) -> Unit = {},
 ) {
     private val manager = context.getSystemService(CameraManager::class.java)
     private val learnedStore = LearnedLensStore(context)
@@ -58,6 +47,7 @@ class CameraPreviewController(
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
     private var activeSurface: Surface? = null
+    private var repeatingSurface: Surface? = null
     private var yuvReader: ImageReader? = null
     private var nativeSessionHandle: Long = 0L
     private var started = false
@@ -66,6 +56,22 @@ class CameraPreviewController(
     private var pendingSurfaceProof: LensCapability? = null
     private var lastYuvProofStableId: String? = null
     private var nativeFallbackAttemptedForCameraId: String? = null
+    private var orientationRegistered = false
+    private var activeFocusPoint: FocusMeteringPoint? = null
+    @Volatile private var physicalSurfaceRotationDegrees = DeviceOrientationTracker.surfaceRotationDegrees
+
+    private val orientationCallback: (Int) -> Unit = { degrees ->
+        physicalSurfaceRotationDegrees = degrees
+        val view = textureView
+        val lens = selectedLens
+        if (view != null && lens != null && view.isAvailable) {
+            view.post {
+                if (textureView === view && selectedLens?.stableId == lens.stableId && view.isAvailable) {
+                    configureTransform(lens, view.width, view.height)
+                }
+            }
+        }
+    }
 
     private val surfaceListener = object : TextureView.SurfaceTextureListener {
         override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
@@ -89,12 +95,17 @@ class CameraPreviewController(
     fun attach(view: TextureView) {
         textureView = view
         view.surfaceTextureListener = surfaceListener
+        if (!orientationRegistered) {
+            DeviceOrientationTracker.register(context, orientationCallback)
+            orientationRegistered = true
+        }
         if (view.isAvailable) openIfReady()
     }
 
     fun setLens(lens: LensCapability?) {
         if (selectedLens?.stableId == lens?.stableId) return
         selectedLens = lens
+        activeFocusPoint = null
         nativeFallbackAttemptedForCameraId = null
         restartCamera()
     }
@@ -111,9 +122,90 @@ class CameraPreviewController(
 
     fun release() {
         stop()
+        if (orientationRegistered) {
+            DeviceOrientationTracker.unregister(orientationCallback)
+            orientationRegistered = false
+        }
         textureView?.surfaceTextureListener = null
         textureView = null
         cameraThread.quitSafely()
+    }
+
+    /**
+     * Focus the subject underneath a view-space tap.
+     *
+     * The mapped physical-sensor point is always published, including NDK preview routes. This is
+     * important because an NDK-only aux preview can still use a standards-correct physical-via-
+     * logical Camera2 route for the final RAW exposure; SingleRawCaptureEngine reuses this point.
+     */
+    fun tapToFocus(viewX: Float, viewY: Float) {
+        val view = textureView ?: return
+        val lens = selectedLens ?: return
+        val characteristics = runCatching {
+            manager.getCameraCharacteristics(lens.physicalCameraId ?: lens.cameraId)
+        }.getOrElse {
+            runCatching { manager.getCameraCharacteristics(lens.openCameraId) }.getOrNull()
+        } ?: return
+
+        val point = FocusMetering.fromViewTap(
+            view = view,
+            characteristics = characteristics,
+            isFrontFacing = lens.isFrontFacing,
+            surfaceRotationDegrees = physicalSurfaceRotationDegrees,
+            viewX = viewX,
+            viewY = viewY,
+        )
+        activeFocusPoint = point
+        view.post { onFocusPoint(point) }
+
+        // Native preview currently exposes no request-reconfiguration JNI. The point still follows
+        // the shutter into the Java physical RAW route, so final RAW focus remains user controlled.
+        if (lens.accessPath == CameraAccessPath.NDK_DIRECT) return
+        handler.post { performTapFocus(lens, characteristics, point) }
+    }
+
+    private fun performTapFocus(
+        lens: LensCapability,
+        characteristics: CameraCharacteristics,
+        point: FocusMeteringPoint,
+    ) {
+        if (selectedLens?.stableId != lens.stableId || !started) return
+        val camera = cameraDevice ?: return
+        val session = captureSession ?: return
+        val target = repeatingSurface ?: return
+        val autofocusSupported = FocusMetering.supportsAutofocus(characteristics)
+        val lockMode = if (autofocusSupported) {
+            FocusMetering.lockAfMode(characteristics)
+        } else {
+            CaptureRequest.CONTROL_AF_MODE_OFF
+        }
+
+        fun request(trigger: Int): CaptureRequest =
+            camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                addTarget(target)
+                applyAutoControls(
+                    builder = this,
+                    lens = lens,
+                    characteristics = characteristics,
+                    focusPoint = point,
+                    afModeOverride = lockMode,
+                    afTrigger = trigger,
+                )
+            }.build()
+
+        runCatching {
+            if (autofocusSupported) {
+                session.capture(request(CaptureRequest.CONTROL_AF_TRIGGER_CANCEL), null, handler)
+                session.capture(request(CaptureRequest.CONTROL_AF_TRIGGER_START), null, handler)
+            }
+            // Keep AUTO/MACRO in IDLE after START so the lock stays on the selected subject instead
+            // of immediately returning to continuous scanning.
+            session.setRepeatingRequest(
+                request(CaptureRequest.CONTROL_AF_TRIGGER_IDLE),
+                null,
+                handler,
+            )
+        }
     }
 
     private fun restartCamera() {
@@ -135,12 +227,10 @@ class CameraPreviewController(
             val openGeneration = generation
             handler.post {
                 if (!started || generation != openGeneration || hasActiveRoute()) return@post
-                if (lens.qualification.previewSessionQualified) {
-                    startNativeSurfacePreview(lens)
-                } else if (lens.qualification.yuvSessionQualified) {
-                    startNativeYuvPreview(lens)
-                } else {
-                    onStatus("${lens.displayName}: no renderable NDK preview path")
+                when {
+                    lens.qualification.previewSessionQualified -> startNativeSurfacePreview(lens)
+                    lens.qualification.yuvSessionQualified -> startNativeYuvPreview(lens)
+                    else -> onStatus("${lens.displayName}: no renderable NDK preview path")
                 }
             }
             return
@@ -148,10 +238,7 @@ class CameraPreviewController(
 
         val openGeneration = generation
         onStatus("Opening ${lens.displayName}")
-
         try {
-            // Handler overload is intentionally used instead of the API-28 Executor overload.
-            // A number of vendor Camera2 implementations are more reliable on this original path.
             manager.openCamera(lens.openCameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
                     if (openGeneration != generation || !started) {
@@ -159,38 +246,34 @@ class CameraPreviewController(
                         return
                     }
                     cameraDevice = camera
-                    if (lens.qualification.previewSessionQualified) {
-                        createSurfacePreviewSession(camera, lens)
-                    } else if (lens.qualification.yuvSessionQualified) {
-                        createJavaYuvPreviewSession(camera, lens)
-                    } else {
-                        camera.close()
-                        cameraDevice = null
-                        handleJavaRouteFailure(lens, "No renderable Java preview path")
+                    when {
+                        lens.qualification.previewSessionQualified -> createSurfacePreviewSession(camera, lens)
+                        lens.qualification.yuvSessionQualified -> createJavaYuvPreviewSession(camera, lens)
+                        else -> {
+                            camera.close()
+                            cameraDevice = null
+                            handleJavaRouteFailure(lens, "No renderable Java preview path")
+                        }
                     }
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
                     camera.close()
                     if (cameraDevice === camera) cameraDevice = null
-                    if (openGeneration == generation && started) {
-                        handleJavaRouteFailure(lens, "Camera disconnected")
-                    }
+                    if (openGeneration == generation && started) handleJavaRouteFailure(lens, "Camera disconnected")
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
                     camera.close()
                     if (cameraDevice === camera) cameraDevice = null
-                    if (openGeneration == generation && started) {
-                        handleJavaRouteFailure(lens, "Camera error $error")
-                    }
+                    if (openGeneration == generation && started) handleJavaRouteFailure(lens, "Camera error $error")
                 }
             }, handler)
-        } catch (security: SecurityException) {
+        } catch (_: SecurityException) {
             onStatus("Camera permission denied")
         } catch (access: CameraAccessException) {
             handleJavaRouteFailure(lens, "Camera unavailable: ${access.reason}")
-        } catch (illegal: IllegalArgumentException) {
+        } catch (_: IllegalArgumentException) {
             handleJavaRouteFailure(lens, "Java route rejected")
         } catch (t: Throwable) {
             handleJavaRouteFailure(lens, "Camera open failed: ${t.javaClass.simpleName}")
@@ -198,9 +281,7 @@ class CameraPreviewController(
     }
 
     private fun handleJavaRouteFailure(lens: LensCapability, reason: String) {
-        if (lens.learnedFromCache) {
-            learnedStore.removeRoute(lens.stableId)
-        }
+        if (lens.learnedFromCache) learnedStore.removeRoute(lens.stableId)
         if (
             lens.accessPath == CameraAccessPath.JAVA_DIRECT &&
             nativeFallbackAttemptedForCameraId != lens.cameraId &&
@@ -212,8 +293,7 @@ class CameraPreviewController(
                 logicalCameraId = lens.cameraId,
                 physicalCameraId = null,
                 accessPath = CameraAccessPath.NDK_DIRECT,
-                discoverySources = (lens.discoverySources - CameraDiscoverySource.LEARNED_CACHE) +
-                    CameraDiscoverySource.NDK_DIRECT,
+                discoverySources = (lens.discoverySources - CameraDiscoverySource.LEARNED_CACHE) + CameraDiscoverySource.NDK_DIRECT,
                 qualification = LensQualification(
                     accessPathOpenQualified = false,
                     previewSessionQualified = lens.previewSizes.isNotEmpty(),
@@ -249,14 +329,15 @@ class CameraPreviewController(
         if (!start.started) {
             surface.release()
             if (lens.yuvSizes.isNotEmpty()) {
-                val yuvFallback = lens.copy(
-                    qualification = lens.qualification.copy(
-                        previewSessionQualified = false,
-                        yuvSessionQualified = true,
-                        detail = "NDK Surface failed; trying YUV",
+                startNativeYuvPreview(
+                    lens.copy(
+                        qualification = lens.qualification.copy(
+                            previewSessionQualified = false,
+                            yuvSessionQualified = true,
+                            detail = "NDK Surface failed; trying YUV",
+                        )
                     )
                 )
-                startNativeYuvPreview(yuvFallback)
             } else {
                 onStatus("NDK preview failed at ${start.stageLabel}: ${start.status}")
             }
@@ -270,11 +351,10 @@ class CameraPreviewController(
 
     private fun startNativeYuvPreview(lens: LensCapability) {
         val view = textureView ?: return
-        val size = chooseYuvPreviewSize(lens.yuvSizes)
-            ?: run {
-                onStatus("${lens.displayName}: YUV size unavailable")
-                return
-            }
+        val size = chooseYuvPreviewSize(lens.yuvSizes) ?: run {
+            onStatus("${lens.displayName}: YUV size unavailable")
+            return
+        }
         configureTransform(lens, view.width, view.height, size)
         val reader = createYuvReader(size, lens) ?: return
         val start = NativeCameraSession.startPreview(lens.cameraId, reader.surface)
@@ -292,14 +372,13 @@ class CameraPreviewController(
         val view = textureView ?: return
         val texture = view.surfaceTexture ?: return
         val previewSize = choosePreviewSize(lens.previewSizes, view.width, view.height)
-
         texture.setDefaultBufferSize(previewSize.width, previewSize.height)
         configureTransform(lens, view.width, view.height, previewSize)
 
         val surface = Surface(texture)
         activeSurface = surface
+        repeatingSurface = surface
         val output = physicalOutput(surface, lens)
-
         val config = SessionConfiguration(
             SessionConfiguration.SESSION_REGULAR,
             listOf(output),
@@ -312,9 +391,10 @@ class CameraPreviewController(
                     }
                     captureSession = session
                     try {
+                        val characteristics = cameraCharacteristicsFor(lens)
                         val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                             addTarget(surface)
-                            applyAutoControls(this, lens)
+                            applyAutoControls(this, lens, characteristics, activeFocusPoint)
                         }.build()
                         session.setRepeatingRequest(request, null, handler)
                         pendingSurfaceProof = provenSurfaceRoute(lens)
@@ -333,7 +413,6 @@ class CameraPreviewController(
                 }
             },
         )
-
         try {
             camera.createCaptureSession(config)
         } catch (t: Throwable) {
@@ -344,16 +423,15 @@ class CameraPreviewController(
 
     private fun createJavaYuvPreviewSession(camera: CameraDevice, lens: LensCapability) {
         val view = textureView ?: return
-        val size = chooseYuvPreviewSize(lens.yuvSizes)
-            ?: run {
-                onStatus("${lens.displayName}: YUV size unavailable")
-                return
-            }
+        val size = chooseYuvPreviewSize(lens.yuvSizes) ?: run {
+            onStatus("${lens.displayName}: YUV size unavailable")
+            return
+        }
         configureTransform(lens, view.width, view.height, size)
         val reader = createYuvReader(size, lens) ?: return
         yuvReader = reader
+        repeatingSurface = reader.surface
         val output = physicalOutput(reader.surface, lens)
-
         val config = SessionConfiguration(
             SessionConfiguration.SESSION_REGULAR,
             listOf(output),
@@ -366,9 +444,10 @@ class CameraPreviewController(
                     }
                     captureSession = session
                     try {
+                        val characteristics = cameraCharacteristicsFor(lens)
                         val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                             addTarget(reader.surface)
-                            applyAutoControls(this, lens)
+                            applyAutoControls(this, lens, characteristics, activeFocusPoint)
                         }.build()
                         session.setRepeatingRequest(request, null, handler)
                         onStatus("${lens.displayName} • YUV preview ${size.width}×${size.height}")
@@ -386,7 +465,6 @@ class CameraPreviewController(
                 }
             },
         )
-
         try {
             camera.createCaptureSession(config)
         } catch (t: Throwable) {
@@ -402,6 +480,7 @@ class CameraPreviewController(
         if (cameraDevice === camera) cameraDevice = null
         runCatching { surface.release() }
         if (activeSurface === surface) activeSurface = null
+        if (repeatingSurface === surface) repeatingSurface = null
         pendingSurfaceProof = null
     }
 
@@ -410,6 +489,7 @@ class CameraPreviewController(
         captureSession = null
         runCatching { camera.close() }
         if (cameraDevice === camera) cameraDevice = null
+        if (repeatingSurface === reader.surface) repeatingSurface = null
         runCatching { reader.setOnImageAvailableListener(null, null) }
         runCatching { reader.close() }
         if (yuvReader === reader) yuvReader = null
@@ -459,12 +539,8 @@ class CameraPreviewController(
 
     private fun persistAndPublishProvenRoute(route: LensCapability) {
         learnedStore.upsertProvenRoute(route)
-        val learnedRoute = route.copy(
-            discoverySources = route.discoverySources + CameraDiscoverySource.LEARNED_CACHE,
-        )
-        textureView?.post {
-            onRouteProven(learnedRoute)
-        }
+        val learnedRoute = route.copy(discoverySources = route.discoverySources + CameraDiscoverySource.LEARNED_CACHE)
+        textureView?.post { onRouteProven(learnedRoute) }
     }
 
     private fun provenSurfaceRoute(lens: LensCapability): LensCapability = lens.copy(
@@ -511,7 +587,6 @@ class CameraPreviewController(
                 val yValue = yBuffer.get(yIndex).toInt() and 0xff
                 val uValue = (uBuffer.get(uIndex).toInt() and 0xff) - 128
                 val vValue = (vBuffer.get(vIndex).toInt() and 0xff) - 128
-
                 val c = max(0, yValue - 16)
                 val r = clamp8((298 * c + 409 * vValue + 128) shr 8)
                 val g = clamp8((298 * c - 100 * uValue - 208 * vValue + 128) shr 8)
@@ -520,12 +595,31 @@ class CameraPreviewController(
             }
         }
 
-        val bitmap = Bitmap.createBitmap(pixels, outWidth, outHeight, Bitmap.Config.ARGB_8888)
+        val sourceBitmap = Bitmap.createBitmap(pixels, outWidth, outHeight, Bitmap.Config.ARGB_8888)
+        val chars = runCatching {
+            manager.getCameraCharacteristics(lens.physicalCameraId ?: lens.openCameraId)
+        }.getOrNull()
+        val sensorOrientation = chars?.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+        val rotationDegrees = CameraOrientation.sensorToDeviceDegrees(
+            sensorOrientation = sensorOrientation,
+            isFrontFacing = lens.isFrontFacing,
+            surfaceRotationDegrees = physicalSurfaceRotationDegrees,
+        )
+        val bitmapMatrix = Matrix().apply {
+            if (rotationDegrees != 0) postRotate(rotationDegrees.toFloat())
+        }
+        val displayBitmap = if (rotationDegrees != 0) {
+            Bitmap.createBitmap(sourceBitmap, 0, 0, sourceBitmap.width, sourceBitmap.height, bitmapMatrix, true)
+        } else {
+            sourceBitmap
+        }
+
+        view.setTransform(Matrix())
         val canvas = runCatching { view.lockCanvas() }.getOrNull()
         if (canvas != null) {
             try {
                 canvas.drawBitmap(
-                    bitmap,
+                    displayBitmap,
                     null,
                     Rect(0, 0, view.width.coerceAtLeast(1), view.height.coerceAtLeast(1)),
                     null,
@@ -534,28 +628,33 @@ class CameraPreviewController(
                 view.unlockCanvasAndPost(canvas)
             }
         }
-        bitmap.recycle()
-        configureTransform(lens, view.width, view.height, Size(outWidth, outHeight))
+        if (displayBitmap !== sourceBitmap) displayBitmap.recycle()
+        sourceBitmap.recycle()
     }
 
     private fun clamp8(value: Int): Int = value.coerceIn(0, 255)
 
+    private fun cameraCharacteristicsFor(lens: LensCapability): CameraCharacteristics =
+        runCatching { manager.getCameraCharacteristics(lens.physicalCameraId ?: lens.cameraId) }
+            .getOrElse { manager.getCameraCharacteristics(lens.openCameraId) }
+
     private fun applyAutoControls(
         builder: CaptureRequest.Builder,
         lens: LensCapability,
+        characteristics: CameraCharacteristics = cameraCharacteristicsFor(lens),
+        focusPoint: FocusMeteringPoint? = null,
+        afModeOverride: Int? = null,
+        afTrigger: Int = CaptureRequest.CONTROL_AF_TRIGGER_IDLE,
     ) {
-        builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-        builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-        val afModes = runCatching {
-            manager.getCameraCharacteristics(lens.physicalCameraId ?: lens.openCameraId)
-                .get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
-                ?.toSet()
-        }.getOrNull().orEmpty()
-        when {
-            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE in afModes ->
-                builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-            CaptureRequest.CONTROL_AF_MODE_AUTO in afModes ->
-                builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+        val physicalId = lens.physicalCameraId
+        FocusMetering.set(builder, CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO, physicalId)
+        FocusMetering.set(builder, CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON, physicalId)
+        FocusMetering.set(builder, CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO, physicalId)
+        val afMode = afModeOverride ?: FocusMetering.previewAfMode(characteristics)
+        FocusMetering.set(builder, CaptureRequest.CONTROL_AF_MODE, afMode, physicalId)
+        FocusMetering.applyRegions(builder, characteristics, physicalId, focusPoint)
+        if (afMode != CaptureRequest.CONTROL_AF_MODE_OFF) {
+            FocusMetering.set(builder, CaptureRequest.CONTROL_AF_TRIGGER, afTrigger, physicalId)
         }
     }
 
@@ -576,15 +675,12 @@ class CameraPreviewController(
         } else {
             16.0 / 9.0
         }
-
-        val bounded = sizes.filter { size ->
-            max(size.width, size.height) <= 1920 && minOf(size.width, size.height) <= 1080
+        val bounded = sizes.filter {
+            max(it.width, it.height) <= 1920 && minOf(it.width, it.height) <= 1080
         }.ifEmpty { sizes }
-
         return bounded.minWithOrNull(
-            compareBy<Size> { size ->
-                abs(size.width.toDouble() / size.height.toDouble() - targetRatio)
-            }.thenByDescending { size -> size.width.toLong() * size.height.toLong() }
+            compareBy<Size> { abs(it.width.toDouble() / it.height.toDouble() - targetRatio) }
+                .thenByDescending { it.width.toLong() * it.height.toLong() }
         ) ?: sizes.first()
     }
 
@@ -596,6 +692,12 @@ class CameraPreviewController(
         return (bounded.ifEmpty { sizes }).maxByOrNull { it.width.toLong() * it.height.toLong() }
     }
 
+    /**
+     * SurfaceTexture output already accounts for camera sensor orientation. We only compensate for
+     * the independently tracked physical device rotation while the Activity itself stays portrait.
+     * CPU YUV is rotated explicitly in renderYuvFrame and therefore uses an identity TextureView.
+     * Front preview is intentionally NOT mirrored so preview geometry matches the captured DNG.
+     */
     private fun configureTransform(
         lens: LensCapability,
         viewWidth: Int,
@@ -605,47 +707,35 @@ class CameraPreviewController(
         val view = textureView ?: return
         if (viewWidth <= 0 || viewHeight <= 0) return
 
-        val sourceSizes = if (lens.qualification.previewSessionQualified) lens.previewSizes else lens.yuvSizes
-        val size = previewSize ?: choosePreviewSize(sourceSizes, viewWidth, viewHeight)
-        val chars = runCatching {
-            manager.getCameraCharacteristics(lens.physicalCameraId ?: lens.openCameraId)
-        }.getOrNull()
-        val sensorOrientation = chars?.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
-        val displayRotation = view.display?.rotation ?: Surface.ROTATION_0
-        val displayDegrees = when (displayRotation) {
-            Surface.ROTATION_90 -> 90
-            Surface.ROTATION_180 -> 180
-            Surface.ROTATION_270 -> 270
-            else -> 0
+        if (!lens.qualification.previewSessionQualified) {
+            view.setTransform(Matrix())
+            return
         }
 
-        val relativeRotation = if (lens.isFrontFacing) {
-            (sensorOrientation + displayDegrees) % 360
-        } else {
-            (sensorOrientation - displayDegrees + 360) % 360
-        }
-
-        val rotated = relativeRotation == 90 || relativeRotation == 270
-        val bufferWidth = if (rotated) size.height.toFloat() else size.width.toFloat()
-        val bufferHeight = if (rotated) size.width.toFloat() else size.height.toFloat()
-
-        val viewRect = RectF(0f, 0f, viewWidth.toFloat(), viewHeight.toFloat())
-        val bufferRect = RectF(0f, 0f, bufferWidth, bufferHeight)
-        val centerX = viewRect.centerX()
-        val centerY = viewRect.centerY()
-        bufferRect.offset(centerX - bufferRect.centerX(), centerY - bufferRect.centerY())
+        val size = previewSize ?: choosePreviewSize(lens.previewSizes, viewWidth, viewHeight)
+        val deviceDegrees = physicalSurfaceRotationDegrees
+        val rotationDegrees = CameraOrientation.surfacePreviewRotationDegrees(
+            isFrontFacing = lens.isFrontFacing,
+            surfaceRotationDegrees = deviceDegrees,
+        )
 
         val matrix = Matrix()
-        matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
-        val scale = max(
-            viewHeight.toFloat() / bufferHeight,
-            viewWidth.toFloat() / bufferWidth,
-        )
-        matrix.postScale(scale, scale, centerX, centerY)
-        matrix.postRotate(relativeRotation.toFloat(), centerX, centerY)
-        if (lens.isFrontFacing) {
-            matrix.postScale(-1f, 1f, centerX, centerY)
+        val viewRect = RectF(0f, 0f, viewWidth.toFloat(), viewHeight.toFloat())
+        val centerX = viewRect.centerX()
+        val centerY = viewRect.centerY()
+
+        if (deviceDegrees == 90 || deviceDegrees == 270) {
+            val bufferRect = RectF(0f, 0f, size.height.toFloat(), size.width.toFloat())
+            bufferRect.offset(centerX - bufferRect.centerX(), centerY - bufferRect.centerY())
+            matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
+            val scale = max(
+                viewHeight.toFloat() / size.height.toFloat().coerceAtLeast(1f),
+                viewWidth.toFloat() / size.width.toFloat().coerceAtLeast(1f),
+            )
+            matrix.postScale(scale, scale, centerX, centerY)
         }
+
+        matrix.postRotate(rotationDegrees.toFloat(), centerX, centerY)
         view.setTransform(matrix)
     }
 
@@ -655,24 +745,20 @@ class CameraPreviewController(
     private fun closeCamera() {
         pendingSurfaceProof = null
         lastYuvProofStableId = null
-
+        repeatingSurface = null
         if (nativeSessionHandle != 0L) {
             runCatching { NativeCameraSession.stop(nativeSessionHandle) }
             nativeSessionHandle = 0L
         }
-
         runCatching { captureSession?.stopRepeating() }
         runCatching { captureSession?.abortCaptures() }
         runCatching { captureSession?.close() }
         captureSession = null
-
         runCatching { cameraDevice?.close() }
         cameraDevice = null
-
         runCatching { yuvReader?.setOnImageAvailableListener(null, null) }
         runCatching { yuvReader?.close() }
         yuvReader = null
-
         runCatching { activeSurface?.release() }
         activeSurface = null
         lastYuvRenderNs = 0L
