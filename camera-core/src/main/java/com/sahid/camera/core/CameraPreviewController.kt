@@ -520,9 +520,8 @@ class CameraPreviewController(
         )
         val bitmapMatrix = Matrix().apply {
             if (rotationDegrees != 0) postRotate(rotationDegrees.toFloat())
-            if (lens.isFrontFacing) postScale(-1f, 1f)
         }
-        val displayBitmap = if (rotationDegrees != 0 || lens.isFrontFacing) {
+        val displayBitmap = if (rotationDegrees != 0) {
             Bitmap.createBitmap(sourceBitmap, 0, 0, sourceBitmap.width, sourceBitmap.height, bitmapMatrix, true)
         } else {
             sourceBitmap
@@ -602,6 +601,7 @@ class CameraPreviewController(
      * SurfaceTexture output already accounts for camera sensor orientation. We only compensate for
      * the independently tracked physical device rotation while the Activity itself stays portrait.
      * CPU YUV is rotated explicitly in renderYuvFrame and therefore uses an identity TextureView.
+     * Front preview is intentionally NOT mirrored so preview geometry matches the captured DNG.
      */
     private fun configureTransform(
         lens: LensCapability,
@@ -641,9 +641,6 @@ class CameraPreviewController(
         }
 
         matrix.postRotate(rotationDegrees.toFloat(), centerX, centerY)
-        if (lens.isFrontFacing) {
-            matrix.postScale(-1f, 1f, centerX, centerY)
-        }
         view.setTransform(matrix)
     }
 
