@@ -7,6 +7,7 @@ import android.graphics.Bitmap
 import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCaptureSession
@@ -53,6 +54,21 @@ class CameraPreviewController(
     private var pendingSurfaceProof: LensCapability? = null
     private var lastYuvProofStableId: String? = null
     private var nativeFallbackAttemptedForCameraId: String? = null
+    private var orientationRegistered = false
+    @Volatile private var physicalSurfaceRotationDegrees = DeviceOrientationTracker.surfaceRotationDegrees
+
+    private val orientationCallback: (Int) -> Unit = { degrees ->
+        physicalSurfaceRotationDegrees = degrees
+        val view = textureView
+        val lens = selectedLens
+        if (view != null && lens != null && view.isAvailable) {
+            view.post {
+                if (textureView === view && selectedLens?.stableId == lens.stableId && view.isAvailable) {
+                    configureTransform(lens, view.width, view.height)
+                }
+            }
+        }
+    }
 
     private val surfaceListener = object : TextureView.SurfaceTextureListener {
         override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
@@ -76,6 +92,10 @@ class CameraPreviewController(
     fun attach(view: TextureView) {
         textureView = view
         view.surfaceTextureListener = surfaceListener
+        if (!orientationRegistered) {
+            DeviceOrientationTracker.register(context, orientationCallback)
+            orientationRegistered = true
+        }
         if (view.isAvailable) openIfReady()
     }
 
@@ -98,6 +118,10 @@ class CameraPreviewController(
 
     fun release() {
         stop()
+        if (orientationRegistered) {
+            DeviceOrientationTracker.unregister(orientationCallback)
+            orientationRegistered = false
+        }
         textureView?.surfaceTextureListener = null
         textureView = null
         cameraThread.quitSafely()
@@ -484,12 +508,32 @@ class CameraPreviewController(
             }
         }
 
-        val bitmap = Bitmap.createBitmap(pixels, outWidth, outHeight, Bitmap.Config.ARGB_8888)
+        val sourceBitmap = Bitmap.createBitmap(pixels, outWidth, outHeight, Bitmap.Config.ARGB_8888)
+        val chars = runCatching {
+            manager.getCameraCharacteristics(lens.physicalCameraId ?: lens.openCameraId)
+        }.getOrNull()
+        val sensorOrientation = chars?.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+        val rotationDegrees = CameraOrientation.sensorToDeviceDegrees(
+            sensorOrientation = sensorOrientation,
+            isFrontFacing = lens.isFrontFacing,
+            surfaceRotationDegrees = physicalSurfaceRotationDegrees,
+        )
+        val bitmapMatrix = Matrix().apply {
+            if (rotationDegrees != 0) postRotate(rotationDegrees.toFloat())
+            if (lens.isFrontFacing) postScale(-1f, 1f)
+        }
+        val displayBitmap = if (rotationDegrees != 0 || lens.isFrontFacing) {
+            Bitmap.createBitmap(sourceBitmap, 0, 0, sourceBitmap.width, sourceBitmap.height, bitmapMatrix, true)
+        } else {
+            sourceBitmap
+        }
+
+        view.setTransform(Matrix())
         val canvas = runCatching { view.lockCanvas() }.getOrNull()
         if (canvas != null) {
             try {
                 canvas.drawBitmap(
-                    bitmap,
+                    displayBitmap,
                     null,
                     Rect(0, 0, view.width.coerceAtLeast(1), view.height.coerceAtLeast(1)),
                     null,
@@ -498,8 +542,8 @@ class CameraPreviewController(
                 view.unlockCanvasAndPost(canvas)
             }
         }
-        bitmap.recycle()
-        configureTransform(lens, view.width, view.height, Size(outWidth, outHeight))
+        if (displayBitmap !== sourceBitmap) displayBitmap.recycle()
+        sourceBitmap.recycle()
     }
 
     private fun clamp8(value: Int): Int = value.coerceIn(0, 255)
@@ -555,9 +599,9 @@ class CameraPreviewController(
     }
 
     /**
-     * TextureView transforms map the sensor buffer into the portrait-locked app. The previous code
-     * rotated in the sensor's direction; for display we need the inverse rotation. This path is shared
-     * by Java Surface, NDK Surface, Java YUV and NDK YUV previews.
+     * SurfaceTexture output already accounts for camera sensor orientation. We only compensate for
+     * the independently tracked physical device rotation while the Activity itself stays portrait.
+     * CPU YUV is rotated explicitly in renderYuvFrame and therefore uses an identity TextureView.
      */
     private fun configureTransform(
         lens: LensCapability,
@@ -568,39 +612,37 @@ class CameraPreviewController(
         val view = textureView ?: return
         if (viewWidth <= 0 || viewHeight <= 0) return
 
-        val sourceSizes = if (lens.qualification.previewSessionQualified) lens.previewSizes else lens.yuvSizes
-        val size = previewSize ?: choosePreviewSize(sourceSizes, viewWidth, viewHeight)
-        val chars = runCatching {
-            manager.getCameraCharacteristics(lens.physicalCameraId ?: lens.openCameraId)
-        }.getOrNull()
-        val sensorOrientation = chars?.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
-        val displayRotation = view.display?.rotation ?: Surface.ROTATION_0
-        val displayDegrees = when (displayRotation) {
-            Surface.ROTATION_90 -> 90
-            Surface.ROTATION_180 -> 180
-            Surface.ROTATION_270 -> 270
-            else -> 0
-        }
-        val relativeRotation = if (lens.isFrontFacing) {
-            (sensorOrientation + displayDegrees) % 360
-        } else {
-            (sensorOrientation - displayDegrees + 360) % 360
+        if (!lens.qualification.previewSessionQualified) {
+            view.setTransform(Matrix())
+            return
         }
 
-        val rotated = relativeRotation == 90 || relativeRotation == 270
-        val rotatedWidth = if (rotated) size.height.toFloat() else size.width.toFloat()
-        val rotatedHeight = if (rotated) size.width.toFloat() else size.height.toFloat()
-        val scale = max(
-            viewWidth.toFloat() / rotatedWidth.coerceAtLeast(1f),
-            viewHeight.toFloat() / rotatedHeight.coerceAtLeast(1f),
+        val size = previewSize ?: choosePreviewSize(lens.previewSizes, viewWidth, viewHeight)
+        val deviceDegrees = physicalSurfaceRotationDegrees
+        val rotationDegrees = CameraOrientation.surfacePreviewRotationDegrees(
+            isFrontFacing = lens.isFrontFacing,
+            surfaceRotationDegrees = deviceDegrees,
         )
 
-        val matrix = Matrix().apply {
-            setTranslate(-size.width / 2f, -size.height / 2f)
-            postRotate(-relativeRotation.toFloat())
-            if (lens.isFrontFacing) postScale(-1f, 1f)
-            postScale(scale, scale)
-            postTranslate(viewWidth / 2f, viewHeight / 2f)
+        val matrix = Matrix()
+        val viewRect = RectF(0f, 0f, viewWidth.toFloat(), viewHeight.toFloat())
+        val centerX = viewRect.centerX()
+        val centerY = viewRect.centerY()
+
+        if (deviceDegrees == 90 || deviceDegrees == 270) {
+            val bufferRect = RectF(0f, 0f, size.height.toFloat(), size.width.toFloat())
+            bufferRect.offset(centerX - bufferRect.centerX(), centerY - bufferRect.centerY())
+            matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
+            val scale = max(
+                viewHeight.toFloat() / size.height.toFloat().coerceAtLeast(1f),
+                viewWidth.toFloat() / size.width.toFloat().coerceAtLeast(1f),
+            )
+            matrix.postScale(scale, scale, centerX, centerY)
+        }
+
+        matrix.postRotate(rotationDegrees.toFloat(), centerX, centerY)
+        if (lens.isFrontFacing) {
+            matrix.postScale(-1f, 1f, centerX, centerY)
         }
         view.setTransform(matrix)
     }
