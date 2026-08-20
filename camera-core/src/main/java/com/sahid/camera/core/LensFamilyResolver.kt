@@ -119,7 +119,7 @@ object LensFamilyResolver {
             familyId = canonicalId,
             defaultRoute = default,
             aliases = aliases,
-            selectorVisible = !isInternalControlFamily(routes, allUsableRoutes),
+            selectorVisible = !isInternalControlDefault(default, allUsableRoutes),
         )
     }
 
@@ -129,25 +129,21 @@ object LensFamilyResolver {
      * addressable. Keep it cached for topology and future PHYSICAL_VIA_LOGICAL routing, but don't
      * expose it beside the real child lenses.
      *
-     * Public Java logical cameras are intentionally not hidden here: on many phones the public
-     * logical camera is the normal main camera and may be the only universally usable default.
+     * Only the chosen default is evaluated here. If a logical control route has already been merged
+     * into a family whose default is a real public/physical lens, the family remains visible and the
+     * control route simply stays as an internal alias.
      */
-    private fun isInternalControlFamily(
-        familyRoutes: List<LensCapability>,
+    private fun isInternalControlDefault(
+        default: LensCapability,
         allUsableRoutes: List<LensCapability>,
     ): Boolean {
-        val familyIds = familyRoutes.mapTo(mutableSetOf()) { it.cameraId }
-        val visibleTargetIds = allUsableRoutes.mapTo(mutableSetOf()) { it.cameraId }
+        if (default.physicalCameraId != null) return false
+        if (default.accessPath != CameraAccessPath.NDK_DIRECT) return false
+        if (CameraDiscoverySource.JAVA_DIRECT in default.discoverySources) return false
+        if (!default.isLogicalMultiCamera || default.logicalPhysicalIds.isEmpty()) return false
 
-        return familyRoutes.any { route ->
-            route.cameraId in familyIds &&
-                route.physicalCameraId == null &&
-                route.accessPath == CameraAccessPath.NDK_DIRECT &&
-                CameraDiscoverySource.JAVA_DIRECT !in route.discoverySources &&
-                route.isLogicalMultiCamera &&
-                route.logicalPhysicalIds.isNotEmpty() &&
-                route.logicalPhysicalIds.any { childId -> childId in visibleTargetIds }
-        }
+        val visibleTargetIds = allUsableRoutes.mapTo(mutableSetOf()) { it.cameraId }
+        return default.logicalPhysicalIds.any { childId -> childId in visibleTargetIds }
     }
 
     private fun canonicalCameraId(routes: List<LensCapability>): String {
