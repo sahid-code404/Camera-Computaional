@@ -31,7 +31,7 @@ object AuroraDngWriter {
         image: Image,
         characteristics: CameraCharacteristics,
         captureResult: CaptureResult,
-        displayRotation: Int,
+        surfaceRotationDegrees: Int,
     ): RawCaptureRecord {
         require(image.format == ImageFormat.RAW_SENSOR) { "DNG requires RAW_SENSOR" }
         val resultTimestamp = captureResult.get(CaptureResult.SENSOR_TIMESTAMP)
@@ -46,7 +46,7 @@ object AuroraDngWriter {
         val uprightDegrees = CameraOrientation.sensorToDeviceDegrees(
             sensorOrientation = sensorOrientation,
             isFrontFacing = lens.isFrontFacing,
-            displayRotation = displayRotation,
+            surfaceRotationDegrees = surfaceRotationDegrees,
         )
         val orientation = CameraOrientation.exifOrientationForDegrees(uprightDegrees)
         val relativePath = CameraStoragePolicy.DNG_RELATIVE_PATH
