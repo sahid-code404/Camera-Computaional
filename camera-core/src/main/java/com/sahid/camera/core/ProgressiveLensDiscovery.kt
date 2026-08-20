@@ -20,6 +20,9 @@ import kotlin.math.atan
  * configures a capture session. Java/NDK advertised metadata plus the bounded native numeric
  * metadata view are merged into route profiles. [LensFamilyResolver] then exposes one default route
  * per physical lens family while [CandidateLensStore] retains every alias/profile internally.
+ *
+ * The expensive metadata pass is performed only once per Build.FINGERPRINT. Later launches restore
+ * the complete learned + candidate family map from SharedPreferences and return immediately.
  */
 class ProgressiveLensDiscovery(context: Context) {
     private val appContext = context.applicationContext
@@ -28,6 +31,11 @@ class ProgressiveLensDiscovery(context: Context) {
     private val candidateStore = CandidateLensStore(appContext)
 
     fun discover(maxNumericId: Int = AUTO_METADATA_MAX_ID): List<LensCapability> {
+        val cachedLearned = learnedStore.load().routes.filter { it.userVisible }
+        if (candidateStore.hasCompletedAutoScan()) {
+            return LensFamilyResolver.defaultsForSelector(cachedLearned + candidateStore.load())
+        }
+
         val javaIds = runCatching { manager.cameraIdList.toList() }
             .getOrDefault(emptyList())
             .distinct()
@@ -81,7 +89,7 @@ class ProgressiveLensDiscovery(context: Context) {
             .values
             .mapNotNull { routes -> routes.minByOrNull(::routeScore) }
 
-        val learnedRoutes = learnedStore.load().routes.filter { it.userVisible }
+        val learnedRoutes = cachedLearned
         val learnedIds = learnedRoutes.mapTo(mutableSetOf()) { it.cameraId }
 
         // Persist ALL unproven endpoint profiles before family collapsing. This is the critical
