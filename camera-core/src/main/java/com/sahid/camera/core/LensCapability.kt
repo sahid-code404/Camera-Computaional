@@ -15,6 +15,8 @@ enum class CameraDiscoverySource {
     LOGICAL_PHYSICAL,
     HIDDEN_ID_PROBE,
     DEEP_OPEN_PROBE,
+    /** Per-build route learned from a previous real-frame qualification. */
+    LEARNED_CACHE,
 }
 
 data class LensCapability(
@@ -64,6 +66,9 @@ data class LensCapability(
 
     val deepOpenDiscovered: Boolean
         get() = CameraDiscoverySource.DEEP_OPEN_PROBE in discoverySources
+
+    val learnedFromCache: Boolean
+        get() = CameraDiscoverySource.LEARNED_CACHE in discoverySources
 
     /**
      * A lens is visible only when Camera has a renderer for the qualified output.
