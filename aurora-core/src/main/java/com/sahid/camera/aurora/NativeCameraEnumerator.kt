@@ -69,9 +69,10 @@ data class HiddenCameraProbeResult(
 /**
  * Native Camera2 discovery used as an independent view of the camera service.
  *
- * [includeDirectOpenFallback] lets the UI use a very cheap metadata-only background pass while a
- * live preview is already running. The explicit compatibility/deep scan can still enable direct
- * open fallback for metadata-filtered IDs. Both modes reuse one ACameraManager per scan.
+ * Besides normal ACameraManager_getCameraIdList enumeration, Phase 01 can perform a bounded
+ * numeric compatibility scan. The native implementation reuses one ACameraManager for metadata
+ * and direct-open fallback probing so invalid IDs are rejected quickly without Java callback
+ * timeouts or hundreds of manager allocations.
  */
 object NativeCameraEnumerator {
     const val DEFAULT_HIDDEN_SCAN_MAX_ID = 255
@@ -86,10 +87,9 @@ object NativeCameraEnumerator {
 
     fun searchHiddenNumericIds(
         maxNumericId: Int = DEFAULT_HIDDEN_SCAN_MAX_ID,
-        includeDirectOpenFallback: Boolean = true,
     ): HiddenCameraProbeResult = runCatching {
         val boundedMax = maxNumericId.coerceIn(0, 1024)
-        val root = JSONObject(nativeSearchHiddenNumericJson(boundedMax, includeDirectOpenFallback))
+        val root = JSONObject(nativeSearchHiddenNumericJson(boundedMax))
         HiddenCameraProbeResult(
             maxNumericId = root.optInt("maxId", boundedMax),
             attemptedCount = root.optInt("attemptedCount", 0),
@@ -106,10 +106,7 @@ object NativeCameraEnumerator {
         NativeCameraOpenProbe(cameraId, nativeProbeDirectOpen(cameraId))
 
     private external fun nativeEnumerateJson(): String
-    private external fun nativeSearchHiddenNumericJson(
-        maxNumericId: Int,
-        includeDirectOpenFallback: Boolean,
-    ): String
+    private external fun nativeSearchHiddenNumericJson(maxNumericId: Int): String
     private external fun nativeProbeDirectOpen(cameraId: String): Int
 
     private fun parseCameraArray(values: JSONArray?): List<NativeCameraInfo> {
