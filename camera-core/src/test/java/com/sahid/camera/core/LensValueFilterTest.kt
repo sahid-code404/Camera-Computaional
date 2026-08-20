@@ -6,7 +6,7 @@ import org.junit.Test
 
 class LensValueFilterTest {
     @Test
-    fun keepsTwoLearnedNonLogicalRoutesEvenWhenMetadataMatches() {
+    fun keepsTwoLearnedHiddenAuxiliariesEvenWhenMetadataMatches() {
         val first = lens(
             id = "20",
             learned = true,
@@ -14,6 +14,7 @@ class LensValueFilterTest {
             sensorWidth = 4.0f,
             sensorHeight = 3.0f,
             fov = 92.0f,
+            hidden = true,
         )
         val second = lens(
             id = "22",
@@ -22,6 +23,7 @@ class LensValueFilterTest {
             sensorWidth = 4.0f,
             sensorHeight = 3.0f,
             fov = 92.0f,
+            hidden = true,
         )
 
         val result = LensValueFilter.filterForSelector(listOf(first, second))
@@ -30,77 +32,115 @@ class LensValueFilterTest {
     }
 
     @Test
-    fun missingSensorGeometryNeverCollapsesSimilarFov() {
-        val main = lens(
-            id = "0",
+    fun learningOneHiddenAuxiliaryDoesNotEraseMatchingUnprovenAuxiliary() {
+        val learned = lens(
+            id = "20",
             learned = true,
-            focal = 4.7f,
-            sensorWidth = null,
-            sensorHeight = null,
-            fov = 74.0f,
+            focal = 1.9f,
+            sensorWidth = 4.0f,
+            sensorHeight = 3.0f,
+            fov = 92.0f,
+            hidden = true,
         )
         val candidate = lens(
-            id = "100",
+            id = "22",
             learned = false,
-            focal = 4.7f,
+            focal = 1.9f,
+            sensorWidth = 4.0f,
+            sensorHeight = 3.0f,
+            fov = 92.0f,
+            hidden = true,
+        )
+
+        val result = LensValueFilter.filterForSelector(listOf(learned, candidate))
+
+        assertEquals(listOf("20", "22"), result.map { it.cameraId })
+    }
+
+    @Test
+    fun missingSensorGeometryNeverCollapsesHiddenCameraBehindPublicCamera() {
+        val public = lens(
+            id = "1",
+            learned = true,
+            focal = 3.7f,
             sensorWidth = null,
             sensorHeight = null,
             fov = 74.0f,
+            accessPath = CameraAccessPath.JAVA_DIRECT,
+            javaPublic = true,
         )
-
-        val result = LensValueFilter.filterForSelector(listOf(main, candidate))
-
-        assertEquals(2, result.size)
-    }
-
-    @Test
-    fun unprovenExactOpticalAliasCanStillBeSuppressedBehindLearnedRoute() {
-        val main = lens(
-            id = "0",
-            learned = true,
-            focal = 4.7f,
-            sensorWidth = 5.6f,
-            sensorHeight = 4.2f,
-            fov = 61.5f,
-        )
-        val alias = lens(
-            id = "100",
+        val hidden = lens(
+            id = "101",
             learned = false,
-            focal = 4.7f,
-            sensorWidth = 5.6f,
-            sensorHeight = 4.2f,
-            fov = 61.5f,
+            focal = 3.7f,
+            sensorWidth = null,
+            sensorHeight = null,
+            fov = 74.0f,
+            hidden = true,
         )
 
-        val result = LensValueFilter.filterForSelector(listOf(main, alias))
+        val result = LensValueFilter.filterForSelector(listOf(public, hidden))
 
-        assertEquals(listOf("0"), result.map { it.cameraId })
+        assertEquals(listOf("1", "101"), result.map { it.cameraId })
     }
 
     @Test
-    fun learnedLogicalAliasCanBeSuppressedByLearnedPhysicalRoute() {
-        val physical = lens(
+    fun exactHiddenMirrorOfNormalPublicJavaCameraIsSuppressed() {
+        val public = lens(
+            id = "1",
+            learned = true,
+            focal = 3.7f,
+            sensorWidth = 5.0f,
+            sensorHeight = 3.8f,
+            fov = 68.0f,
+            accessPath = CameraAccessPath.JAVA_DIRECT,
+            javaPublic = true,
+        )
+        val helper = lens(
+            id = "101",
+            learned = false,
+            focal = 3.7f,
+            sensorWidth = 5.0f,
+            sensorHeight = 3.8f,
+            fov = 68.0f,
+            hidden = true,
+        )
+
+        val result = LensValueFilter.filterForSelector(listOf(public, helper))
+
+        assertEquals(listOf("1"), result.map { it.cameraId })
+    }
+
+    @Test
+    fun explicitLogicalParentCanBeSuppressedByEquivalentPhysicalChild() {
+        val logicalParent = lens(
             id = "0",
             learned = true,
             focal = 4.7f,
             sensorWidth = 5.6f,
             sensorHeight = 4.2f,
             fov = 61.5f,
-        )
-        val logicalAlias = lens(
-            id = "61",
-            learned = true,
-            focal = 4.7f,
-            sensorWidth = 5.6f,
-            sensorHeight = 4.2f,
-            fov = 61.5f,
+            accessPath = CameraAccessPath.JAVA_DIRECT,
+            javaPublic = true,
             logical = true,
         )
+        val physicalChild = lens(
+            id = "20",
+            learned = true,
+            focal = 4.7f,
+            sensorWidth = 5.6f,
+            sensorHeight = 4.2f,
+            fov = 61.5f,
+            accessPath = CameraAccessPath.PHYSICAL_VIA_LOGICAL,
+            logical = true,
+            logicalCameraId = "0",
+            physicalCameraId = "20",
+        )
 
-        val result = LensValueFilter.filterForSelector(listOf(physical, logicalAlias))
+        val result = LensValueFilter.filterForSelector(listOf(logicalParent, physicalChild))
 
-        assertEquals(listOf("0"), result.map { it.cameraId })
-        assertTrue(result.none { it.cameraId == "61" })
+        assertEquals(listOf("20"), result.map { it.cameraId })
+        assertTrue(result.none { it.cameraId == "0" })
     }
 
     private fun lens(
@@ -110,14 +150,25 @@ class LensValueFilterTest {
         sensorWidth: Float?,
         sensorHeight: Float?,
         fov: Float?,
+        accessPath: CameraAccessPath = CameraAccessPath.NDK_DIRECT,
+        hidden: Boolean = false,
+        javaPublic: Boolean = false,
         logical: Boolean = false,
+        logicalCameraId: String = id,
+        physicalCameraId: String? = null,
     ): LensCapability = LensCapability(
         cameraId = id,
-        logicalCameraId = id,
-        physicalCameraId = null,
-        accessPath = CameraAccessPath.NDK_DIRECT,
+        logicalCameraId = logicalCameraId,
+        physicalCameraId = physicalCameraId,
+        accessPath = accessPath,
         discoverySources = buildSet {
-            add(CameraDiscoverySource.NDK_DIRECT)
+            when (accessPath) {
+                CameraAccessPath.JAVA_DIRECT -> add(CameraDiscoverySource.JAVA_DIRECT)
+                CameraAccessPath.NDK_DIRECT -> add(CameraDiscoverySource.NDK_DIRECT)
+                CameraAccessPath.PHYSICAL_VIA_LOGICAL -> add(CameraDiscoverySource.LOGICAL_PHYSICAL)
+            }
+            if (javaPublic) add(CameraDiscoverySource.JAVA_DIRECT)
+            if (hidden) add(CameraDiscoverySource.HIDDEN_ID_PROBE)
             if (learned) add(CameraDiscoverySource.LEARNED_CACHE)
             else add(CameraDiscoverySource.AUTO_METADATA)
         },
