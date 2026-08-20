@@ -4,6 +4,12 @@ data class CameraDiscoverySnapshot(
     val javaDirectIds: List<String>,
     val ndkDirectIds: List<String>,
     val logicalTopology: Map<String, List<String>>,
+    val hiddenProbeMaxNumericId: Int = 0,
+    val hiddenProbeAttemptedCount: Int = 0,
+    val hiddenMetadataIds: List<String> = emptyList(),
+    val hiddenDiscoveredIds: List<String> = emptyList(),
+    val hiddenLogicalTopology: Map<String, List<String>> = emptyMap(),
+    val hiddenRejectedStatuses: Map<String, Int> = emptyMap(),
 )
 
 /**
