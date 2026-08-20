@@ -6,12 +6,18 @@ import kotlin.math.max
 /**
  * Conservative user-facing lens identity filter.
  *
- * Camera services can expose logical aliases, helper devices and multiple API routes that render
- * effectively the same optical view. Camera Lab still records those endpoints in diagnostics, but
- * the normal selector should show one representative per useful optical identity.
+ * Different camera IDs are not interchangeable just because vendors report the same focal length,
+ * sensor size or FOV. Phones commonly contain two real auxiliary modules built from very similar
+ * sensors, so learning one route must never make another hidden auxiliary disappear on restart.
  *
- * Safety rule: uncertainty keeps a camera visible. Missing geometry, merely similar focal lengths,
- * or merely similar FOV values are never enough to hide a potentially real physical lens.
+ * Cross-ID suppression is therefore limited to evidence that is materially stronger than optical
+ * similarity alone:
+ *  1. explicit logical-parent -> physical-child topology, or
+ *  2. a hidden numeric/NDK endpoint that is an exact optical match for a normal public Java camera.
+ *
+ * The second rule targets OEM helper aliases such as a hidden mirror of the public front/main
+ * camera without collapsing two independent hidden auxiliary IDs. Uncertainty keeps the camera
+ * visible.
  */
 object LensValueFilter {
     fun filterForSelector(routes: List<LensCapability>): List<LensCapability> {
@@ -41,11 +47,6 @@ object LensValueFilter {
         )
     }
 
-    /**
-     * Different frame-proven non-logical IDs are treated as separate real endpoints even when
-     * vendors report very similar optical metadata. A frame-proven logical parent may still be
-     * suppressed when a proven/non-logical child represents the same optical view.
-     */
     private fun shouldSuppress(
         candidate: LensCapability,
         representative: LensCapability,
@@ -53,29 +54,28 @@ object LensValueFilter {
         if (candidate.cameraId == representative.cameraId) return true
         if (knownFacingMismatch(candidate, representative)) return false
 
-        val candidateProven = candidate.learnedFromCache
-        val representativeProven = representative.learnedFromCache
-
+        // A logical parent may duplicate the exact view of one of its explicitly-addressable
+        // physical children. Because physical children are scored ahead of logical parents below,
+        // the parent arrives later and can be safely suppressed only when the optics also match.
         if (
-            candidateProven && representativeProven &&
-            !candidate.isLogicalMultiCamera && !representative.isLogicalMultiCamera
+            isLogicalParentOf(candidate, representative) &&
+            opticalEquivalent(candidate, representative)
         ) {
-            return false
+            return true
         }
 
-        if (!opticalEquivalent(candidate, representative)) return false
+        // Never collapse one hidden auxiliary behind another hidden auxiliary just because their
+        // modules report the same focal length/sensor geometry. Macro/depth/mono modules often do.
+        // A hidden endpoint is treated as a helper alias only when it exactly mirrors a normal
+        // public Java camera.
+        if (
+            isHiddenDirect(candidate) &&
+            isNormalPublicJava(representative) &&
+            opticalEquivalent(candidate, representative)
+        ) {
+            return true
+        }
 
-        // Explicit logical/helper structure is strong evidence that one route is an alias.
-        if (candidate.isLogicalMultiCamera && !representative.isLogicalMultiCamera) return true
-        if (representative.isLogicalMultiCamera && !candidate.isLogicalMultiCamera) return false
-
-        // An unproven metadata candidate may be hidden behind a frame-proven equivalent. The
-        // inverse is never allowed: real-frame evidence always survives optimistic metadata.
-        if (!candidateProven && representativeProven) return true
-        if (candidateProven && !representativeProven) return false
-
-        // Two merely metadata-discovered non-logical IDs stay visible. We do not know yet whether
-        // they are two physical sensors with similar optics or an OEM alias.
         return false
     }
 
@@ -89,15 +89,13 @@ object LensValueFilter {
             val delta = abs(leftFov - rightFov)
             val relative = delta / max(leftFov, rightFov)
             if (delta <= MAX_FOV_DELTA_DEGREES || relative <= MAX_FOV_RELATIVE_DELTA) {
-                // Similar FOV is only strong evidence when the physical sensor geometry is also
-                // completely present and compatible. Missing geometry means 'unknown', not 'same'.
+                // Similar FOV is only strong evidence when complete physical sensor geometry is
+                // also compatible. Missing geometry means unknown, never same.
                 return sensorGeometryStronglyCompatible(left, right)
             }
             return false
         }
 
-        // Geometry fallback: same focal length + same complete physical sensor dimensions is
-        // strong enough to identify likely aliases when FOV cannot be derived.
         val leftFocal = left.focalLengthMm
         val rightFocal = right.focalLengthMm
         val leftWidth = left.sensorWidthMm
@@ -119,6 +117,23 @@ object LensValueFilter {
 
         return false
     }
+
+    private fun isLogicalParentOf(parent: LensCapability, child: LensCapability): Boolean =
+        parent.isLogicalMultiCamera &&
+            parent.physicalCameraId == null &&
+            child.physicalCameraId != null &&
+            child.logicalCameraId == parent.cameraId
+
+    private fun isHiddenDirect(lens: LensCapability): Boolean =
+        lens.physicalCameraId == null &&
+            lens.accessPath == CameraAccessPath.NDK_DIRECT &&
+            CameraDiscoverySource.HIDDEN_ID_PROBE in lens.discoverySources
+
+    private fun isNormalPublicJava(lens: LensCapability): Boolean =
+        lens.physicalCameraId == null &&
+            lens.accessPath == CameraAccessPath.JAVA_DIRECT &&
+            CameraDiscoverySource.JAVA_DIRECT in lens.discoverySources &&
+            CameraDiscoverySource.HIDDEN_ID_PROBE !in lens.discoverySources
 
     private fun sensorGeometryStronglyCompatible(
         left: LensCapability,
@@ -143,7 +158,7 @@ object LensValueFilter {
     private fun routeScore(lens: LensCapability): Int {
         var score = 0
 
-        // A route that already produced a frame is the strongest representative.
+        // A route that already produced a frame is the strongest representative for the same ID.
         if (!lens.learnedFromCache) score += 100
 
         score += when (lens.accessPath) {
@@ -152,8 +167,11 @@ object LensValueFilter {
             CameraAccessPath.NDK_DIRECT -> 20
         }
         if (CameraDiscoverySource.HIDDEN_ID_PROBE in lens.discoverySources) score += 25
-        if (lens.isLogicalMultiCamera) score += 15
         if (CameraDiscoverySource.CANDIDATE_CACHE in lens.discoverySources) score += 5
+
+        // If a logical parent and one of its physical children have the same view, inspect the
+        // physical child first so the later parent can be removed rather than the reverse.
+        if (lens.isLogicalMultiCamera && lens.physicalCameraId == null) score += 40
 
         return score
     }
