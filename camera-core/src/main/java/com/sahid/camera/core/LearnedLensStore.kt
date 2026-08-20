@@ -13,6 +13,7 @@ import org.json.JSONObject
  * Once a route has produced a usable preview/YUV result, remember it for this exact
  * Build.FINGERPRINT. A ROM/OTA fingerprint change invalidates it automatically. Fast startup can
  * therefore restore proven lenses without repeating session qualification or hidden-ID scanning.
+ * Logical->physical topology is persisted as well so lens families remain stable after restart.
  */
 class LearnedLensStore(context: Context) {
     private val appContext = context.applicationContext
@@ -39,21 +40,14 @@ class LearnedLensStore(context: Context) {
             }
         }
 
-        // Seamless upgrade from Phase-01 schema-v5 diagnostics. This prevents users who already
-        // completed the expensive hidden scan from paying that cost once more after this update.
         return migrateLegacyQualificationCache()
             ?: Snapshot(deepScanCompleted = false, routes = emptyList())
     }
 
-    /** Save only routes that already produced a usable preview/YUV result in the deep pass. */
     fun saveDeepScan(report: CameraQualificationReport) {
         saveRoutes(report.visibleLenses, deepScanCompleted = true)
     }
 
-    /**
-     * Fast/public discovery also teaches the cache. This is what makes the second launch instant
-     * even when the user never needed the explicit hidden-lens scan.
-     */
     fun mergeProvenRoutes(routes: List<LensCapability>) {
         val current = load()
         val merged = (current.routes + routes)
@@ -64,7 +58,6 @@ class LearnedLensStore(context: Context) {
         saveRoutes(merged, deepScanCompleted = current.deepScanCompleted)
     }
 
-    /** Save a route only after the live preview path has actually produced a frame. */
     fun upsertProvenRoute(route: LensCapability) {
         if (!route.userVisible) return
         val learnedRoute = route.copy(
@@ -76,10 +69,6 @@ class LearnedLensStore(context: Context) {
         saveRoutes(merged, deepScanCompleted = current.deepScanCompleted)
     }
 
-    /**
-     * Drop one stale access route without forgetting the rest of the phone's learned lens map.
-     * A failed Java route can therefore be replaced by an NDK route for the same camera ID.
-     */
     fun removeRoute(stableId: String) {
         val current = load()
         if (current.routes.none { it.stableId == stableId }) return
@@ -95,7 +84,7 @@ class LearnedLensStore(context: Context) {
 
     private fun saveRoutes(routes: List<LensCapability>, deepScanCompleted: Boolean) {
         val payload = JSONObject()
-            .put("schemaVersion", 1)
+            .put("schemaVersion", 2)
             .put("buildFingerprint", Build.FINGERPRINT)
             .put("sdkInt", Build.VERSION.SDK_INT)
             .put("deepScanCompleted", deepScanCompleted)
@@ -123,8 +112,6 @@ class LearnedLensStore(context: Context) {
                 .mapNotNull { paths -> paths.minByOrNull(::legacyRouteScore) }
         }.getOrNull() ?: return null
 
-        // The old cache only exists after a complete Phase-01 qualification report was saved.
-        // Treat it as a completed deep scan even when the device had no hidden lenses.
         saveRoutes(routes, deepScanCompleted = true)
         return Snapshot(deepScanCompleted = true, routes = routes)
     }
@@ -173,6 +160,7 @@ class LearnedLensStore(context: Context) {
             burstCapture = item.optBoolean("burstCapture", false),
             maxResolutionSensor = item.optBoolean("ultraHighResolutionSensor", false),
             isLogicalMultiCamera = item.optBoolean("logicalMultiCamera", false),
+            logicalPhysicalIds = emptySet(),
             usableForPreview = previewSize != null || yuvSize != null,
             nativeHardwareLevel = item.optNullableInt("nativeHardwareLevel"),
             nativeCharacteristicsStatus = item.optNullableInt("nativeCharacteristicsStatus"),
@@ -221,6 +209,7 @@ class LearnedLensStore(context: Context) {
         put("burstCapture", lens.burstCapture)
         put("maxResolutionSensor", lens.maxResolutionSensor)
         put("logicalMultiCamera", lens.isLogicalMultiCamera)
+        put("logicalPhysicalIds", JSONArray(lens.logicalPhysicalIds.toList().sorted()))
         put("nativeHardwareLevel", lens.nativeHardwareLevel ?: JSONObject.NULL)
         put("nativeCharacteristicsStatus", lens.nativeCharacteristicsStatus ?: JSONObject.NULL)
         put("qualification", JSONObject().apply {
@@ -274,6 +263,7 @@ class LearnedLensStore(context: Context) {
                     burstCapture = item.optBoolean("burstCapture", false),
                     maxResolutionSensor = item.optBoolean("maxResolutionSensor", false),
                     isLogicalMultiCamera = item.optBoolean("logicalMultiCamera", false),
+                    logicalPhysicalIds = item.optStringSet("logicalPhysicalIds"),
                     usableForPreview = previewSizes.isNotEmpty() || yuvSizes.isNotEmpty(),
                     nativeHardwareLevel = item.optNullableInt("nativeHardwareLevel"),
                     nativeCharacteristicsStatus = item.optNullableInt("nativeCharacteristicsStatus"),
@@ -309,6 +299,16 @@ class LearnedLensStore(context: Context) {
         return buildList {
             for (index in 0 until values.length()) {
                 values.optJSONObject(index)?.toSize()?.let(::add)
+            }
+        }
+    }
+
+    private fun JSONObject.optStringSet(name: String): Set<String> {
+        val values = optJSONArray(name) ?: return emptySet()
+        return buildSet {
+            for (index in 0 until values.length()) {
+                val value = values.optString(index, "")
+                if (value.isNotBlank()) add(value)
             }
         }
     }
