@@ -8,6 +8,12 @@ import android.hardware.camera2.CameraManager
 import android.util.Size
 import com.sahid.camera.aurora.NativeCameraEnumerator
 import com.sahid.camera.aurora.NativeCameraInfo
+import java.util.Locale
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.atan
+import kotlin.math.roundToInt
+import kotlin.math.tan
 
 /**
  * Phase-01 universal camera discovery and runtime qualification.
@@ -17,8 +23,9 @@ import com.sahid.camera.aurora.NativeCameraInfo
  *  2. NDK ACameraManager_getCameraIdList
  *  3. logical-camera physicalCameraIds topology
  *
- * No candidate is discarded simply because SurfaceTexture metadata is absent. Static
- * metadata is evidence only; actual open/session tests decide what can be exposed.
+ * Every Java and NDK direct route is represented independently, even when both APIs return
+ * the same ID. That matters on devices where Java can enumerate an ID but only the NDK route
+ * can actually create a useful session.
  */
 class CameraCapabilityProbe(context: Context) {
     private val appContext = context.applicationContext
@@ -28,7 +35,11 @@ class CameraCapabilityProbe(context: Context) {
     /** Metadata-only view for diagnostics. It is not allowed to drive final UI exposure. */
     fun probeUsableLenses(): List<LensCapability> {
         val discovery = discoverCandidates()
-        return assignUserFacingNames(selectPreferredAccessPaths(discovery.candidates))
+        val preferred = discovery.candidates
+            .groupBy { it.cameraId }
+            .values
+            .mapNotNull { paths -> paths.minByOrNull { accessPriority(it.accessPath) } }
+        return assignUserFacingNames(preferred)
     }
 
     fun probeQualifiedLenses(
@@ -55,15 +66,24 @@ class CameraCapabilityProbe(context: Context) {
             }
         }
 
-        // The same physical lens can be reachable through more than one path. Prefer a
-        // successful direct path, but preserve all paths in diagnostics for evidence.
-        val preferredVisible = qualified
+        // First collapse multiple access routes to one proven route per actual camera ID.
+        // Renderer quality wins before API preference, so a native PRIVATE preview beats a
+        // Java YUV-only fallback for the same sensor.
+        val bestPerCameraId = qualified
             .filter { it.userVisible }
             .groupBy { it.cameraId }
             .values
-            .mapNotNull { paths -> paths.minByOrNull { accessPriority(it.accessPath) } }
+            .mapNotNull { paths -> paths.minByOrNull(::qualifiedPathScore) }
 
-        val namedVisible = assignUserFacingNames(preferredVisible.map { it.copy(displayName = "Lens") })
+        // Then collapse logical/physical/helper identities by optical equivalence. A logical
+        // stream is kept when it represents a genuinely different FOV; an equivalent physical
+        // member wins when both represent the same lens.
+        val identityFiltered = collapseUserLensIdentities(
+            bestPerCameraId,
+            discovery.snapshot.logicalTopology,
+        )
+
+        val namedVisible = assignUserFacingNames(identityFiltered.map { it.copy(displayName = "Lens") })
         val visibleNamesByCameraId = namedVisible.associate { it.cameraId to it.displayName }
         val namedCandidates = qualified.map { lens ->
             lens.copy(displayName = visibleNamesByCameraId[lens.cameraId] ?: lens.displayName)
@@ -100,35 +120,45 @@ class CameraCapabilityProbe(context: Context) {
         }.toMap()
 
         val candidates = mutableListOf<LensCapability>()
-        val allDirectIds = (javaDirectIds + ndkDirectIds).distinct().sorted()
 
-        // Direct IDs are always represented as direct candidates. If an ID is visible to
-        // both APIs, Java is the normal session path and NDK remains recorded as a source.
-        allDirectIds.forEach { cameraId ->
-            val chars = safeCharacteristics(cameraId)
-            val native = ndkById[cameraId]
+        // Java and NDK paths remain independent. Do not collapse a shared ID before runtime
+        // qualification: Java may enumerate/open differently from ACameraManager on OEM builds.
+        javaDirectIds.forEach { cameraId ->
             val sources = buildSet {
-                if (cameraId in javaDirectSet) add(CameraDiscoverySource.JAVA_DIRECT)
+                add(CameraDiscoverySource.JAVA_DIRECT)
                 if (cameraId in ndkDirectSet) add(CameraDiscoverySource.NDK_DIRECT)
             }
             buildCapability(
                 cameraId = cameraId,
                 logicalCameraId = cameraId,
                 physicalCameraId = null,
-                chars = chars,
-                native = native,
-                accessPath = if (cameraId in javaDirectSet) {
-                    CameraAccessPath.JAVA_DIRECT
-                } else {
-                    CameraAccessPath.NDK_DIRECT
-                },
+                chars = safeCharacteristics(cameraId),
+                native = ndkById[cameraId],
+                accessPath = CameraAccessPath.JAVA_DIRECT,
+                discoverySources = sources,
+                isLogicalMultiCamera = logicalTopology[cameraId].orEmpty().isNotEmpty(),
+            )?.let(candidates::add)
+        }
+
+        ndkDirectIds.forEach { cameraId ->
+            val sources = buildSet {
+                add(CameraDiscoverySource.NDK_DIRECT)
+                if (cameraId in javaDirectSet) add(CameraDiscoverySource.JAVA_DIRECT)
+            }
+            buildCapability(
+                cameraId = cameraId,
+                logicalCameraId = cameraId,
+                physicalCameraId = null,
+                chars = safeCharacteristics(cameraId),
+                native = ndkById[cameraId],
+                accessPath = CameraAccessPath.NDK_DIRECT,
                 discoverySources = sources,
                 isLogicalMultiCamera = logicalTopology[cameraId].orEmpty().isNotEmpty(),
             )?.let(candidates::add)
         }
 
         // Keep a physical-via-logical candidate even when the same child is also directly
-        // enumerated. Runtime qualification can then prove which access route actually works.
+        // enumerated. Runtime qualification decides which access route is reliable.
         logicalTopology.forEach { (logicalId, physicalIds) ->
             physicalIds.forEach { physicalId ->
                 val sources = buildSet {
@@ -159,11 +189,6 @@ class CameraCapabilityProbe(context: Context) {
         )
     }
 
-    private fun selectPreferredAccessPaths(items: List<LensCapability>): List<LensCapability> =
-        items.groupBy { it.cameraId }
-            .values
-            .mapNotNull { paths -> paths.minByOrNull { accessPriority(it.accessPath) } }
-
     private fun buildCapability(
         cameraId: String,
         logicalCameraId: String,
@@ -190,8 +215,6 @@ class CameraCapabilityProbe(context: Context) {
             ?.toList()
             .orEmpty()
 
-        // NDK PRIVATE outputs are implementation-defined camera outputs and are useful as
-        // candidate preview sizes when OEM Java metadata is incomplete or oddly filtered.
         val previewSizes = mergeSizes(
             javaPreviewSizes,
             native?.privateOutputSizes.orEmpty().map { Size(it.width, it.height) },
@@ -213,6 +236,15 @@ class CameraCapabilityProbe(context: Context) {
             CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW in capabilities
         val rawSupported = rawAdvertisedByJava || native?.rawCapability == true
 
+        val physicalSize = chars?.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+        val sensorWidthMm = physicalSize?.width ?: native?.sensorWidthMm
+        val sensorHeightMm = physicalSize?.height ?: native?.sensorHeightMm
+        val focalLengthMm = chars
+            ?.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+            ?.minOrNull()
+            ?: native?.focalLengthMm
+        val horizontalFov = calculateHorizontalFov(sensorWidthMm, focalLengthMm)
+
         return LensCapability(
             cameraId = cameraId,
             logicalCameraId = logicalCameraId,
@@ -221,10 +253,10 @@ class CameraCapabilityProbe(context: Context) {
             discoverySources = discoverySources,
             facing = chars?.get(CameraCharacteristics.LENS_FACING) ?: native?.facing,
             displayName = "Lens $cameraId",
-            focalLengthMm = chars
-                ?.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
-                ?.minOrNull()
-                ?: native?.focalLengthMm,
+            focalLengthMm = focalLengthMm,
+            sensorWidthMm = sensorWidthMm,
+            sensorHeightMm = sensorHeightMm,
+            horizontalFovDegrees = horizontalFov,
             rawSupported = rawSupported,
             rawSizes = rawSizes,
             previewSizes = previewSizes,
@@ -236,10 +268,81 @@ class CameraCapabilityProbe(context: Context) {
             maxResolutionSensor =
                 CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_ULTRA_HIGH_RESOLUTION_SENSOR in capabilities,
             isLogicalMultiCamera = isLogicalMultiCamera,
-            usableForPreview = previewSizes.isNotEmpty(),
+            usableForPreview = previewSizes.isNotEmpty() || yuvSizes.isNotEmpty(),
             nativeHardwareLevel = native?.hardwareLevel,
             nativeCharacteristicsStatus = native?.characteristicsStatus,
         )
+    }
+
+    private fun collapseUserLensIdentities(
+        items: List<LensCapability>,
+        logicalTopology: Map<String, List<String>>,
+    ): List<LensCapability> {
+        if (items.size <= 1) return items
+        val physicalIds = logicalTopology.values.flatten().toSet()
+
+        // Remove a logical stream only when a qualified physical member is optically
+        // equivalent. This avoids losing a genuine main lens when only aux children expose IDs.
+        val withoutEquivalentLogical = items.filterNot { lens ->
+            val children = logicalTopology[lens.cameraId].orEmpty()
+            children.isNotEmpty() && items.any { child ->
+                child.cameraId in children && equivalentOptics(lens, child)
+            }
+        }
+
+        val clusters = mutableListOf<MutableList<LensCapability>>()
+        withoutEquivalentLogical
+            .sortedWith(compareBy<LensCapability> { it.facing ?: Int.MAX_VALUE }
+                .thenByDescending { it.horizontalFovDegrees ?: Float.NEGATIVE_INFINITY })
+            .forEach { lens ->
+                val cluster = clusters.firstOrNull { existing ->
+                    existing.firstOrNull()?.let { representative ->
+                        representative.facing == lens.facing && equivalentOptics(representative, lens)
+                    } == true
+                }
+                if (cluster != null) cluster += lens else clusters += mutableListOf(lens)
+            }
+
+        return clusters.mapNotNull { cluster ->
+            cluster.minByOrNull { lens ->
+                val physicalIdentityPenalty = if (lens.cameraId in physicalIds) 0 else 100
+                physicalIdentityPenalty + qualifiedPathScore(lens)
+            }
+        }
+    }
+
+    private fun equivalentOptics(left: LensCapability, right: LensCapability): Boolean {
+        if (left.cameraId == right.cameraId) return true
+        val leftFov = left.horizontalFovDegrees
+        val rightFov = right.horizontalFovDegrees
+        if (leftFov != null && rightFov != null && leftFov > 0f && rightFov > 0f) {
+            val delta = abs(leftFov - rightFov)
+            val relative = delta / maxOf(leftFov, rightFov)
+            return delta <= 3.5f || relative <= 0.055f
+        }
+
+        val leftFocal = left.focalLengthMm
+        val rightFocal = right.focalLengthMm
+        if (leftFocal != null && rightFocal != null && leftFocal > 0f && rightFocal > 0f) {
+            return abs(leftFocal - rightFocal) / maxOf(leftFocal, rightFocal) <= 0.06f
+        }
+        return false
+    }
+
+    private fun qualifiedPathScore(lens: LensCapability): Int {
+        val rendererScore = when {
+            lens.qualification.previewSessionQualified -> 0
+            lens.qualification.yuvSessionQualified -> 20
+            lens.qualification.rawSessionQualified -> 40
+            else -> 1000
+        }
+        return rendererScore + accessPriority(lens.accessPath)
+    }
+
+    private fun accessPriority(path: CameraAccessPath): Int = when (path) {
+        CameraAccessPath.JAVA_DIRECT -> 0
+        CameraAccessPath.NDK_DIRECT -> 1
+        CameraAccessPath.PHYSICAL_VIA_LOGICAL -> 2
     }
 
     private fun mergeSizes(vararg groups: List<Size>): List<Size> = groups
@@ -247,40 +350,69 @@ class CameraCapabilityProbe(context: Context) {
         .distinct()
         .sortedByDescending { it.width.toLong() * it.height.toLong() }
 
+    private fun calculateHorizontalFov(sensorWidthMm: Float?, focalLengthMm: Float?): Float? {
+        if (sensorWidthMm == null || focalLengthMm == null || sensorWidthMm <= 0f || focalLengthMm <= 0f) {
+            return null
+        }
+        return (2.0 * atan(sensorWidthMm / (2.0 * focalLengthMm)) * 180.0 / PI).toFloat()
+    }
+
+    private fun fullFrameEquivalentFocal(lens: LensCapability): Double? {
+        val fov = lens.horizontalFovDegrees?.toDouble() ?: return null
+        if (fov <= 0.0 || fov >= 179.0) return null
+        return 18.0 / tan(Math.toRadians(fov / 2.0))
+    }
+
     private fun assignUserFacingNames(items: List<LensCapability>): List<LensCapability> {
         val rear = items.filter { it.facing == CameraCharacteristics.LENS_FACING_BACK }
-            .sortedBy { it.focalLengthMm ?: Float.MAX_VALUE }
         val front = items.filter { it.facing == CameraCharacteristics.LENS_FACING_FRONT }
-            .sortedBy { it.focalLengthMm ?: Float.MAX_VALUE }
         val other = items - rear.toSet() - front.toSet()
 
-        val rearNamed = rear.mapIndexed { index, lens ->
-            val label = when {
-                rear.size == 1 -> "1×"
-                index == 0 -> "Ultra"
-                index == rear.lastIndex -> "Tele"
-                else -> "Main"
+        val rearWithEq = rear.mapNotNull { lens ->
+            fullFrameEquivalentFocal(lens)?.let { lens to it }
+        }
+        val rearNamed = if (rear.isNotEmpty() && rearWithEq.size == rear.size) {
+            val mainEq = rearWithEq.minByOrNull { (_, eq) -> abs(eq - 26.0) }?.second ?: 26.0
+            rearWithEq
+                .sortedBy { (_, eq) -> eq }
+                .map { (lens, eq) ->
+                    lens.copy(displayName = zoomLabel(eq / mainEq))
+                }
+        } else {
+            val sorted = rear.sortedBy { it.focalLengthMm ?: Float.MAX_VALUE }
+            sorted.mapIndexed { index, lens ->
+                val label = when {
+                    sorted.size == 1 -> "1×"
+                    index == 0 -> "Ultra"
+                    index == sorted.lastIndex -> "Tele"
+                    else -> "Main"
+                }
+                lens.copy(displayName = label)
             }
-            lens.copy(displayName = label)
         }
 
-        val frontNamed = front.mapIndexed { index, lens ->
-            lens.copy(displayName = if (front.size == 1) "Front" else "Front ${index + 1}")
-        }
+        val frontNamed = front
+            .sortedByDescending { it.horizontalFovDegrees ?: Float.NEGATIVE_INFINITY }
+            .mapIndexed { index, lens ->
+                lens.copy(displayName = if (front.size == 1) "Front" else "Front ${index + 1}")
+            }
 
         return rearNamed + frontNamed + other.mapIndexed { index, lens ->
             lens.copy(displayName = "Lens ${index + 1}")
         }
     }
 
+    private fun zoomLabel(zoom: Double): String {
+        val rounded = (zoom * 10.0).roundToInt() / 10.0
+        return when {
+            abs(rounded - 1.0) < 0.05 -> "1×"
+            abs(rounded - rounded.roundToInt()) < 0.05 -> "${rounded.roundToInt()}×"
+            else -> String.format(Locale.US, "%.1f×", rounded)
+        }
+    }
+
     private fun safeCharacteristics(cameraId: String): CameraCharacteristics? =
         runCatching { manager.getCameraCharacteristics(cameraId) }.getOrNull()
-
-    private fun accessPriority(path: CameraAccessPath): Int = when (path) {
-        CameraAccessPath.JAVA_DIRECT -> 0
-        CameraAccessPath.NDK_DIRECT -> 1
-        CameraAccessPath.PHYSICAL_VIA_LOGICAL -> 2
-    }
 
     private data class DiscoveryResult(
         val snapshot: CameraDiscoverySnapshot,
