@@ -26,7 +26,7 @@ Binary layout, with big-endian scalar fields:
 4. JSON metadata bytes
 5. exact bytes copied from the single Android RAW image plane
 
-The payload is not repacked. `width`, `height`, `rowStride`, `pixelStride`, byte count, and SHA-256 are stored in the JSON header so the original buffer layout is unambiguous.
+The payload is not repacked. `width`, `height`, `rowStride`, `pixelStride`, byte count, byte order, and SHA-256 are stored in the JSON header so the original buffer layout is unambiguous.
 
 The JSON envelope records route identity, ROM fingerprint, sensor/static calibration metadata when exposed, and per-frame capture metadata such as exposure time, ISO, frame duration, focus distance, aperture, focal length, rolling-shutter skew, white/black level information, neutral point, noise profile, and color correction state when the platform provides them.
 
@@ -34,14 +34,30 @@ The JSON envelope records route identity, ROM fingerprint, sensor/static calibra
 
 Phase 02A uses a dedicated RAW-only session. The UI releases live preview, performs the one-shot capture, validates and writes the AURAW record, then restores preview. This keeps the first RAW truth path auditable.
 
-Phase 02B will replace that temporary hand-off with simultaneous preview + RAW multi-output sessions and route-family fallback without changing the canonical AURAW source contract.
+A lightweight JPEG rendition is derived only after canonical AURAW persistence. It is generated from the same RAW packet for gallery qualification and is never used as a computational input. Later Aurora Render Engine output will replace this temporary renderer without changing the canonical source contract.
 
-## Storage during development
+Phase 02B will replace the temporary preview hand-off with simultaneous preview + RAW multi-output sessions and route-family fallback without changing the canonical AURAW source contract.
 
-On Android 10+, completed AURAW source records are published through `MediaStore.Files` under the user-visible path:
+## Storage policy
 
-`Documents/Aurora/RAW/`
+Storage follows the product plan's album/gallery model rather than exposing implementation folders as separate user albums.
 
-AURAW is a generic canonical source record (`application/octet-stream`), not a rendered image, so scoped storage does not permit it under the `Pictures` primary directory through `MediaStore.Files`. Rendered/export formats such as JPEG or DNG can use image-oriented public collections later without changing the canonical AURAW contract.
+### User-facing album
 
-Android 9 keeps the conservative app-specific external-files fallback so Phase 02 does not request legacy broad storage permission.
+On Android 10+, the current Phase-02 rendition is published through `MediaStore.Images` to Android's conventional camera album:
+
+`DCIM/Camera/`
+
+This is the item that normal Gallery/Google Photos applications are expected to index. The app should present this as the saved capture and later use it for the camera thumbnail/gallery entry.
+
+### Canonical source master
+
+The immutable custom AURAW source record is a generic binary document, not an image MIME type, so it cannot be portably published as an ordinary image inside `DCIM/Camera`. It is retained separately through `MediaStore.Files` at:
+
+`Documents/Camera/RAW/`
+
+Aurora's own gallery/storage database will pair the AURAW master and its user-facing rendition into one logical capture. Users should not need to browse the RAW-master directory during normal camera use; RAW metadata/view/export will be exposed from the capture item itself.
+
+Android 9 keeps a conservative app-specific external-files fallback so Phase 02 does not request legacy broad storage permission.
+
+A later storage-settings milestone will make the visible save album persistent and user-selectable (`DCIM/Camera`, another Camera album, or a Storage Access Framework tree) without asking on every shutter press.
