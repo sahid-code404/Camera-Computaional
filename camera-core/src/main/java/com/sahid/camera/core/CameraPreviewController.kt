@@ -31,18 +31,20 @@ import kotlin.math.abs
 import kotlin.math.max
 
 /**
- * Phase-01 live preview dispatcher.
+ * Live preview dispatcher optimized for instant cached startup.
  *
- * JAVA_DIRECT and PHYSICAL_VIA_LOGICAL use Java Camera2. NDK_DIRECT stays native all the
- * way through ACameraManager/ACameraDevice/ACameraCaptureSession. If an otherwise usable
- * Java/physical lens only qualified YUV, Camera renders that YUV stream into the TextureView
- * as a low-rate CPU fallback rather than hiding the lens.
+ * JAVA_DIRECT and PHYSICAL_VIA_LOGICAL use Java Camera2. NDK_DIRECT stays native all the way
+ * through ACameraManager/ACameraDevice/ACameraCaptureSession. A learned Java route that becomes
+ * stale is removed immediately and, for a direct camera ID, retried through NDK without forcing a
+ * complete rediscovery pass. Routes are written to the learned cache only after a live frame is
+ * observed by TextureView or ImageReader.
  */
 class CameraPreviewController(
     private val context: Context,
     private val onStatus: (String) -> Unit = {},
 ) {
     private val manager = context.getSystemService(CameraManager::class.java)
+    private val learnedStore = LearnedLensStore(context)
     private val cameraThread = HandlerThread("CameraPreview").apply { start() }
     private val handler = Handler(cameraThread.looper)
     private val executor = Executor { runnable -> handler.post(runnable) }
@@ -57,6 +59,9 @@ class CameraPreviewController(
     private var started = false
     private var generation = 0L
     private var lastYuvRenderNs = 0L
+    private var pendingSurfaceProof: LensCapability? = null
+    private var lastYuvProofStableId: String? = null
+    private var nativeFallbackAttemptedForCameraId: String? = null
 
     private val surfaceListener = object : TextureView.SurfaceTextureListener {
         override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
@@ -72,7 +77,9 @@ class CameraPreviewController(
             return true
         }
 
-        override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
+        override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
+            confirmSurfaceFrame()
+        }
     }
 
     fun attach(view: TextureView) {
@@ -84,6 +91,7 @@ class CameraPreviewController(
     fun setLens(lens: LensCapability?) {
         if (selectedLens?.stableId == lens?.stableId) return
         selectedLens = lens
+        nativeFallbackAttemptedForCameraId = null
         restartCamera()
     }
 
@@ -135,10 +143,12 @@ class CameraPreviewController(
         }
 
         val openGeneration = generation
-        onStatus("Opening ${lens.displayName} via ${lens.accessPath.name}")
+        onStatus("Opening ${lens.displayName}")
 
         try {
-            manager.openCamera(lens.openCameraId, executor, object : CameraDevice.StateCallback() {
+            // Handler overload is intentionally used instead of the API-28 Executor overload.
+            // A number of vendor Camera2 implementations are more reliable on this original path.
+            manager.openCamera(lens.openCameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
                     if (openGeneration != generation || !started) {
                         camera.close()
@@ -150,30 +160,76 @@ class CameraPreviewController(
                     } else if (lens.qualification.yuvSessionQualified) {
                         createJavaYuvPreviewSession(camera, lens)
                     } else {
-                        onStatus("${lens.displayName}: no renderable Java preview path")
                         camera.close()
                         cameraDevice = null
+                        handleJavaRouteFailure(lens, "No renderable Java preview path")
                     }
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
-                    onStatus("Camera disconnected")
                     camera.close()
                     if (cameraDevice === camera) cameraDevice = null
+                    if (openGeneration == generation && started) {
+                        handleJavaRouteFailure(lens, "Camera disconnected")
+                    }
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
-                    onStatus("Camera error $error")
                     camera.close()
                     if (cameraDevice === camera) cameraDevice = null
+                    if (openGeneration == generation && started) {
+                        handleJavaRouteFailure(lens, "Camera error $error")
+                    }
                 }
-            })
+            }, handler)
         } catch (security: SecurityException) {
             onStatus("Camera permission denied")
         } catch (access: CameraAccessException) {
-            onStatus("Camera unavailable: ${access.reason}")
+            handleJavaRouteFailure(lens, "Camera unavailable: ${access.reason}")
+        } catch (illegal: IllegalArgumentException) {
+            handleJavaRouteFailure(lens, "Java route rejected")
         } catch (t: Throwable) {
-            onStatus("Camera open failed: ${t.javaClass.simpleName}")
+            handleJavaRouteFailure(lens, "Camera open failed: ${t.javaClass.simpleName}")
+        }
+    }
+
+    private fun handleJavaRouteFailure(lens: LensCapability, reason: String) {
+        if (lens.learnedFromCache) {
+            learnedStore.removeRoute(lens.stableId)
+        }
+        if (
+            lens.accessPath == CameraAccessPath.JAVA_DIRECT &&
+            nativeFallbackAttemptedForCameraId != lens.cameraId &&
+            started &&
+            selectedLens?.cameraId == lens.cameraId
+        ) {
+            nativeFallbackAttemptedForCameraId = lens.cameraId
+            val fallback = lens.copy(
+                logicalCameraId = lens.cameraId,
+                physicalCameraId = null,
+                accessPath = CameraAccessPath.NDK_DIRECT,
+                discoverySources = (lens.discoverySources - CameraDiscoverySource.LEARNED_CACHE) +
+                    CameraDiscoverySource.NDK_DIRECT,
+                qualification = LensQualification(
+                    accessPathOpenQualified = false,
+                    previewSessionQualified = lens.previewSizes.isNotEmpty(),
+                    yuvSessionQualified = lens.previewSizes.isEmpty() && lens.yuvSizes.isNotEmpty(),
+                    rawSessionQualified = false,
+                    qualifiedRawSize = null,
+                    detail = "Live NDK fallback after Java route failure",
+                ),
+            )
+            onStatus("$reason • trying NDK")
+            handler.post {
+                if (!started || selectedLens?.cameraId != lens.cameraId || hasActiveRoute()) return@post
+                when {
+                    fallback.qualification.previewSessionQualified -> startNativeSurfacePreview(fallback)
+                    fallback.qualification.yuvSessionQualified -> startNativeYuvPreview(fallback)
+                    else -> onStatus("$reason • no NDK preview surface")
+                }
+            }
+        } else {
+            onStatus(reason)
         }
     }
 
@@ -188,11 +244,23 @@ class CameraPreviewController(
         val start = NativeCameraSession.startPreview(lens.cameraId, surface)
         if (!start.started) {
             surface.release()
-            onStatus("NDK preview failed at ${start.stageLabel}: ${start.status}")
+            if (lens.yuvSizes.isNotEmpty()) {
+                val yuvFallback = lens.copy(
+                    qualification = lens.qualification.copy(
+                        previewSessionQualified = false,
+                        yuvSessionQualified = true,
+                        detail = "NDK Surface failed; trying YUV",
+                    )
+                )
+                startNativeYuvPreview(yuvFallback)
+            } else {
+                onStatus("NDK preview failed at ${start.stageLabel}: ${start.status}")
+            }
             return
         }
         activeSurface = surface
         nativeSessionHandle = start.handle
+        pendingSurfaceProof = provenSurfaceRoute(lens)
         onStatus("${lens.displayName} • NDK preview ${previewSize.width}×${previewSize.height}")
     }
 
@@ -213,7 +281,7 @@ class CameraPreviewController(
         }
         yuvReader = reader
         nativeSessionHandle = start.handle
-        onStatus("${lens.displayName} • NDK YUV fallback ${size.width}×${size.height}")
+        onStatus("${lens.displayName} • NDK YUV ${size.width}×${size.height}")
     }
 
     private fun createSurfacePreviewSession(camera: CameraDevice, lens: LensCapability) {
@@ -245,15 +313,19 @@ class CameraPreviewController(
                             applyAutoControls(this, lens)
                         }.build()
                         session.setRepeatingRequest(request, null, handler)
+                        pendingSurfaceProof = provenSurfaceRoute(lens)
                         onStatus("${lens.displayName} • Camera2 preview ${previewSize.width}×${previewSize.height}")
                     } catch (t: Throwable) {
-                        onStatus("Preview request failed: ${t.javaClass.simpleName}")
+                        releaseJavaRoute(camera, surface)
+                        handleJavaRouteFailure(lens, "Preview request failed: ${t.javaClass.simpleName}")
                     }
                 }
 
                 override fun onConfigureFailed(session: CameraCaptureSession) {
-                    onStatus("Preview session unsupported")
                     session.close()
+                    if (captureSession === session) captureSession = null
+                    releaseJavaRoute(camera, surface)
+                    handleJavaRouteFailure(lens, "Preview session unsupported")
                 }
             },
         )
@@ -261,9 +333,8 @@ class CameraPreviewController(
         try {
             camera.createCaptureSession(config)
         } catch (t: Throwable) {
-            onStatus("Session creation failed: ${t.javaClass.simpleName}")
-            surface.release()
-            if (activeSurface === surface) activeSurface = null
+            releaseJavaRoute(camera, surface)
+            handleJavaRouteFailure(lens, "Session creation failed: ${t.javaClass.simpleName}")
         }
     }
 
@@ -296,15 +367,18 @@ class CameraPreviewController(
                             applyAutoControls(this, lens)
                         }.build()
                         session.setRepeatingRequest(request, null, handler)
-                        onStatus("${lens.displayName} • YUV fallback ${size.width}×${size.height}")
+                        onStatus("${lens.displayName} • YUV preview ${size.width}×${size.height}")
                     } catch (t: Throwable) {
-                        onStatus("YUV request failed: ${t.javaClass.simpleName}")
+                        releaseJavaYuvRoute(camera, reader)
+                        handleJavaRouteFailure(lens, "YUV request failed: ${t.javaClass.simpleName}")
                     }
                 }
 
                 override fun onConfigureFailed(session: CameraCaptureSession) {
-                    onStatus("YUV fallback session unsupported")
                     session.close()
+                    if (captureSession === session) captureSession = null
+                    releaseJavaYuvRoute(camera, reader)
+                    handleJavaRouteFailure(lens, "YUV preview unsupported")
                 }
             },
         )
@@ -312,10 +386,29 @@ class CameraPreviewController(
         try {
             camera.createCaptureSession(config)
         } catch (t: Throwable) {
-            onStatus("YUV session creation failed: ${t.javaClass.simpleName}")
-            reader.close()
-            if (yuvReader === reader) yuvReader = null
+            releaseJavaYuvRoute(camera, reader)
+            handleJavaRouteFailure(lens, "YUV session failed: ${t.javaClass.simpleName}")
         }
+    }
+
+    private fun releaseJavaRoute(camera: CameraDevice, surface: Surface) {
+        runCatching { captureSession?.close() }
+        captureSession = null
+        runCatching { camera.close() }
+        if (cameraDevice === camera) cameraDevice = null
+        runCatching { surface.release() }
+        if (activeSurface === surface) activeSurface = null
+        pendingSurfaceProof = null
+    }
+
+    private fun releaseJavaYuvRoute(camera: CameraDevice, reader: ImageReader) {
+        runCatching { captureSession?.close() }
+        captureSession = null
+        runCatching { camera.close() }
+        if (cameraDevice === camera) cameraDevice = null
+        runCatching { reader.setOnImageAvailableListener(null, null) }
+        runCatching { reader.close() }
+        if (yuvReader === reader) yuvReader = null
     }
 
     private fun createYuvReader(size: Size, lens: LensCapability): ImageReader? {
@@ -328,6 +421,7 @@ class CameraPreviewController(
         reader.setOnImageAvailableListener({ source ->
             val image = runCatching { source.acquireLatestImage() }.getOrNull() ?: return@setOnImageAvailableListener
             try {
+                confirmYuvFrame(lens)
                 renderYuvFrame(image, lens)
             } finally {
                 image.close()
@@ -335,6 +429,40 @@ class CameraPreviewController(
         }, handler)
         return reader
     }
+
+    private fun confirmSurfaceFrame() {
+        val route = pendingSurfaceProof ?: return
+        pendingSurfaceProof = null
+        learnedStore.upsertProvenRoute(route)
+    }
+
+    private fun confirmYuvFrame(lens: LensCapability) {
+        if (lastYuvProofStableId == lens.stableId) return
+        lastYuvProofStableId = lens.stableId
+        learnedStore.upsertProvenRoute(
+            lens.copy(
+                qualification = LensQualification(
+                    accessPathOpenQualified = true,
+                    previewSessionQualified = false,
+                    yuvSessionQualified = true,
+                    rawSessionQualified = false,
+                    qualifiedRawSize = null,
+                    detail = "Live YUV frame received",
+                )
+            )
+        )
+    }
+
+    private fun provenSurfaceRoute(lens: LensCapability): LensCapability = lens.copy(
+        qualification = LensQualification(
+            accessPathOpenQualified = true,
+            previewSessionQualified = true,
+            yuvSessionQualified = false,
+            rawSessionQualified = false,
+            qualifiedRawSize = null,
+            detail = "Live TextureView frame received",
+        )
+    )
 
     private fun renderYuvFrame(image: Image, lens: LensCapability) {
         val now = System.nanoTime()
@@ -366,7 +494,7 @@ class CameraPreviewController(
                 val yIndex = sourceY * yPlane.rowStride + sourceX * yPlane.pixelStride
                 val uIndex = chromaY * uPlane.rowStride + chromaX * uPlane.pixelStride
                 val vIndex = chromaY * vPlane.rowStride + chromaX * vPlane.pixelStride
-                val yValue = (yBuffer.get(yIndex).toInt() and 0xff)
+                val yValue = yBuffer.get(yIndex).toInt() and 0xff
                 val uValue = (uBuffer.get(uIndex).toInt() and 0xff) - 128
                 val vValue = (vBuffer.get(vIndex).toInt() and 0xff) - 128
 
@@ -422,7 +550,7 @@ class CameraPreviewController(
             if (lens.accessPath == CameraAccessPath.PHYSICAL_VIA_LOGICAL) {
                 lens.physicalCameraId?.let { physicalId ->
                     runCatching { setPhysicalCameraId(physicalId) }
-                        .onFailure { onStatus("Physical output routing failed: ${it.javaClass.simpleName}") }
+                        .onFailure { onStatus("Physical route failed: ${it.javaClass.simpleName}") }
                 }
             }
         }
@@ -511,6 +639,9 @@ class CameraPreviewController(
         cameraDevice != null || nativeSessionHandle != 0L || yuvReader != null
 
     private fun closeCamera() {
+        pendingSurfaceProof = null
+        lastYuvProofStableId = null
+
         if (nativeSessionHandle != 0L) {
             runCatching { NativeCameraSession.stop(nativeSessionHandle) }
             nativeSessionHandle = 0L
