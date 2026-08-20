@@ -41,6 +41,9 @@ data class HiddenCameraProbeResult(
     val validCameras: List<NativeCameraInfo>,
     val hiddenIds: List<String>,
     val rejectedStatuses: Map<String, Int>,
+    /** Batched NDK open results produced with one ACameraManager instance. */
+    val directOpenStatuses: Map<String, Int> = emptyMap(),
+    val directOpenSucceededIds: List<String> = emptyList(),
 ) {
     val validIds: List<String>
         get() = validCameras.map { it.id }
@@ -57,6 +60,8 @@ data class HiddenCameraProbeResult(
             validCameras = emptyList(),
             hiddenIds = emptyList(),
             rejectedStatuses = emptyMap(),
+            directOpenStatuses = emptyMap(),
+            directOpenSucceededIds = emptyList(),
         )
     }
 }
@@ -65,9 +70,9 @@ data class HiddenCameraProbeResult(
  * Native Camera2 discovery used as an independent view of the camera service.
  *
  * Besides normal ACameraManager_getCameraIdList enumeration, Phase 01 can perform a bounded
- * numeric metadata scan. The scan does not blindly open every ID: it first asks
- * ACameraManager_getCameraCharacteristics and only metadata-valid IDs proceed to runtime
- * frame qualification in camera-core.
+ * numeric compatibility scan. The native implementation reuses one ACameraManager for metadata
+ * and direct-open fallback probing so invalid IDs are rejected quickly without Java callback
+ * timeouts or hundreds of manager allocations.
  */
 object NativeCameraEnumerator {
     const val DEFAULT_HIDDEN_SCAN_MAX_ID = 255
@@ -85,20 +90,14 @@ object NativeCameraEnumerator {
     ): HiddenCameraProbeResult = runCatching {
         val boundedMax = maxNumericId.coerceIn(0, 1024)
         val root = JSONObject(nativeSearchHiddenNumericJson(boundedMax))
-        val rejectedObject = root.optJSONObject("rejectedStatuses") ?: JSONObject()
-        val rejected = buildMap {
-            val keys = rejectedObject.keys()
-            while (keys.hasNext()) {
-                val id = keys.next()
-                put(id, rejectedObject.optInt(id, Int.MIN_VALUE))
-            }
-        }
         HiddenCameraProbeResult(
             maxNumericId = root.optInt("maxId", boundedMax),
             attemptedCount = root.optInt("attemptedCount", 0),
             validCameras = parseCameraArray(root.optJSONArray("validCameras")),
             hiddenIds = root.optStringArray("hiddenIds"),
-            rejectedStatuses = rejected,
+            rejectedStatuses = root.optIntMap("rejectedStatuses"),
+            directOpenStatuses = root.optIntMap("directOpenStatuses"),
+            directOpenSucceededIds = root.optStringArray("directOpenSucceededIds"),
         )
     }.getOrElse { HiddenCameraProbeResult.empty(maxNumericId.coerceIn(0, 1024)) }
 
@@ -158,6 +157,17 @@ object NativeCameraEnumerator {
             for (index in 0 until values.length()) {
                 val value = values.optString(index, "")
                 if (value.isNotEmpty()) add(value)
+            }
+        }
+    }
+
+    private fun JSONObject.optIntMap(name: String): Map<String, Int> {
+        val values = optJSONObject(name) ?: return emptyMap()
+        return buildMap {
+            val keys = values.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                put(key, values.optInt(key, Int.MIN_VALUE))
             }
         }
     }
