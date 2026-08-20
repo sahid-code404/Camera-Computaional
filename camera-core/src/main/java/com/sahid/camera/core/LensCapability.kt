@@ -15,6 +15,8 @@ enum class CameraDiscoverySource {
     LOGICAL_PHYSICAL,
     HIDDEN_ID_PROBE,
     DEEP_OPEN_PROBE,
+    /** Cheap background metadata candidate; first live frame still proves the route. */
+    AUTO_METADATA,
     /** Per-build route learned from a previous real-frame qualification. */
     LEARNED_CACHE,
 }
@@ -42,7 +44,7 @@ data class LensCapability(
     val burstCapture: Boolean,
     val maxResolutionSensor: Boolean,
     val isLogicalMultiCamera: Boolean,
-    /** Metadata hint only. It is never sufficient to expose a lens. */
+    /** Metadata hint only. It is never sufficient to persist a learned route. */
     val usableForPreview: Boolean,
     val nativeHardwareLevel: Int? = null,
     val nativeCharacteristicsStatus: Int? = null,
@@ -70,10 +72,13 @@ data class LensCapability(
     val learnedFromCache: Boolean
         get() = CameraDiscoverySource.LEARNED_CACHE in discoverySources
 
+    val automaticMetadataCandidate: Boolean
+        get() = CameraDiscoverySource.AUTO_METADATA in discoverySources
+
     /**
-     * A lens is visible only when Camera has a renderer for the qualified output.
-     * Surface/PRIVATE preview is preferred; YUV has an explicit CPU fallback renderer.
-     * RAW-only evidence remains diagnostic until Aurora's RAW preview renderer lands.
+     * The live controller can render PRIVATE or YUV routes. For automatic metadata candidates,
+     * these flags are optimistic stream hints only; the candidate is persisted only after an
+     * actual TextureView/ImageReader frame is observed.
      */
     val userVisible: Boolean
         get() = qualification.previewSessionQualified || qualification.yuvSessionQualified
