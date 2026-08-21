@@ -1,1 +1,1 @@
-Trigger the one-shot Phase 01 AUX RAW compatibility workflow.
+Trigger the corrected Phase 01 AUX RAW compatibility workflow.
