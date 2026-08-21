@@ -5,7 +5,7 @@ plugins {
 
 android {
     namespace = "com.sahid.camera.core"
-    compileSdk = 37
+    compileSdk = 36
 
     defaultConfig {
         minSdk = 28
@@ -22,6 +22,7 @@ kotlin {
 }
 
 dependencies {
+    implementation(project(":aurora-core"))
     implementation(libs.androidx.core.ktx)
     testImplementation(libs.junit)
 }

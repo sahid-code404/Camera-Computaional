@@ -4,21 +4,41 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+val otaVersionCode = System.getenv("CAMERA_VERSION_CODE")?.toIntOrNull() ?: 1
+val otaVersionName = System.getenv("CAMERA_VERSION_NAME") ?: "0.1.0-phase01-dev"
+
 android {
     namespace = "com.sahid.camera"
-    compileSdk = 37
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.sahid.camera"
         minSdk = 28
-        targetSdk = 37
-        versionCode = 1
-        versionName = "0.1.0-foundation"
+        targetSdk = 36
+        versionCode = otaVersionCode
+        versionName = otaVersionName
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        buildConfigField(
+            "String",
+            "OTA_MANIFEST_URL",
+            "\"https://github.com/sahid-code404/Camera-Computaional/releases/download/phase01-latest/update.json\"",
+        )
+    }
+
+    signingConfigs {
+        create("phase01Dev") {
+            storeFile = rootProject.file("keystore/phase01-dev.jks")
+            storePassword = "camera-phase01-dev"
+            keyAlias = "camera-phase01"
+            keyPassword = "camera-phase01-dev"
+        }
     }
 
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("phase01Dev")
+        }
         release {
             isMinifyEnabled = false
         }

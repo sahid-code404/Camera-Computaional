@@ -9,7 +9,11 @@ DIST_DIR="$CACHE_DIR/gradle-$GRADLE_VERSION"
 ZIP_FILE="$CACHE_DIR/gradle-$GRADLE_VERSION-bin.zip"
 
 if command -v gradle >/dev/null 2>&1; then
-  exec gradle "$@"
+  INSTALLED_VERSION=$(gradle --version 2>/dev/null | awk '/^Gradle / { print $2; exit }')
+  if [ "$INSTALLED_VERSION" = "$GRADLE_VERSION" ]; then
+    exec gradle "$@"
+  fi
+  echo "Ignoring system Gradle ${INSTALLED_VERSION:-unknown}; Camera requires Gradle $GRADLE_VERSION."
 fi
 
 mkdir -p "$CACHE_DIR"

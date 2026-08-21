@@ -1,32 +1,48 @@
 # Camera — Aurora Computational RAW Camera
 
-`Camera` is a research-grade Android camera project built around a **RAW-first** computational-photography architecture. The internal computational engine is called **Aurora**.
+`Camera` is a RAW-first Android computational-photography project. The internal native image engine is **Aurora**.
 
-This repository is currently the **Foundation milestone**. It is intentionally capability-driven: it discovers Camera2 logical/physical topology, filters preview-usable lens candidates, routes physical preview streams where Android allows it, and proves the Kotlin/Compose ↔ C++20 NDK architecture before adding the expensive RAW pipeline.
+Development is currently on **Phase 01 — Foundation and lens qualification**. The normal camera UI no longer trusts Camera2 IDs or static RAW metadata alone: candidate lenses are runtime-qualified with real Camera2 sessions before they are shown.
+
+## Current Phase 01 behavior
+
+- Discovers public Camera2 logical cameras and framework-exposed physical members.
+- Keeps logical-camera fallbacks for devices where explicit physical streams are rejected.
+- Creates a real preview session before a lens is considered user-visible.
+- When `RAW_SENSOR` is advertised, separately tests a preview + RAW session combination.
+- Shows a RAW badge only after that combination is runtime-qualified.
+- Filters failed physical/logical candidates out of the normal lens selector.
+- Persists the latest qualification evidence by `Build.FINGERPRINT` for diagnostics; cached results never bypass a fresh runtime check.
+- Exports a JSON diagnostic report containing accepted and rejected candidates, topology, capabilities and qualification results.
+- Routes qualified physical preview streams through the logical parent using public Camera2 APIs.
+- Loads the C++20 Aurora NDK core and runs its JNI self-test.
+
+The shutter remains intentionally disabled in Phase 01. Single-frame RAW acquisition and RAW file output start in Phase 02 after real-device lens qualification is proven.
 
 ## Build stack
 
-- Android `compileSdk/targetSdk`: **37**
+- Android `compileSdk` / `targetSdk`: **36**
 - Minimum Android: **API 28**
 - Android Gradle Plugin: **9.3.0**
 - Gradle: **9.5.0**
 - Kotlin: **2.3.21**
-- Jetpack Compose BOM: **2026.08.00**
+- Compose BOM: **2025.12.00**
+- Activity Compose: **1.11.0**
+- Lifecycle: **2.9.4**
+- AndroidX Core: **1.17.0**
 - JDK: **17**
 - NDK: **28.2.13676358**
 - CMake: **3.22.1**
 - Native core: **C++20**
 
-> Build note: AGP 9 normally enables built-in Kotlin. This foundation temporarily opts out (`android.builtInKotlin=false` and `android.newDsl=false`) so Kotlin **2.3.21** and the Compose compiler plugin stay explicitly pinned together. This is a temporary compatibility pin, not a long-term architecture decision.
+The repository intentionally stays on the stable Android 16/API 36 SDK for Phase 01. Android 17/API 37-specific work such as RAW14 belongs in a later, separately tested toolchain upgrade. Compose 1.12+ requires compileSdk 37, so Phase 01 pins the Compose 1.10-era BOM instead of forcing preview SDK infrastructure.
 
 ## Required Android SDK packages
-
-Install:
 
 ```bash
 sdkmanager \
   "platform-tools" \
-  "platforms;android-37" \
+  "platforms;android-36" \
   "build-tools;36.0.0" \
   "ndk;28.2.13676358" \
   "cmake;3.22.1"
@@ -40,17 +56,9 @@ sdk.dir=/path/to/Android/Sdk
 
 ## Build
 
-Linux/macOS:
-
 ```bash
 chmod +x gradlew
 ./gradlew :app:assembleDebug
-```
-
-Windows:
-
-```bat
-gradlew.bat :app:assembleDebug
 ```
 
 Debug APK:
@@ -59,68 +67,48 @@ Debug APK:
 app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Quick source sanity check before a full Android build:
+`gradlew` enforces Gradle 9.5.0. If another system Gradle is installed, the launcher ignores it and downloads/verifies the pinned distribution instead.
+
+Quick source checks:
 
 ```bash
 ./scripts/validate-source.sh
 ```
 
-The included `gradlew`/`gradlew.bat` are transparent bootstrap launchers. If Gradle is not installed, they download the pinned Gradle 9.5.0 binary distribution and verify its official SHA-256 checksum before executing it.
+## Real-device Phase 01 test
 
-## What the current APK does
+Install the debug APK:
 
-- Requests only camera permission.
-- Enumerates public Camera2 devices.
-- Expands logical multi-camera devices into framework-exposed physical members.
-- Filters out candidates with no preview-compatible stream.
-- Displays lens-like choices instead of exposing raw numeric Camera2 IDs.
-- Shows per-lens RAW availability and maximum RAW size where advertised.
-- Opens a live Camera2 preview.
-- Routes a preview output to a selected physical camera through its logical parent when supported.
-- Loads the C++20 Aurora native library and runs a JNI self-test.
+```bash
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
 
-The shutter is **not wired yet**. That is deliberate: capture will only be enabled once preview+RAW session combinations are explicitly qualified per lens so unsupported modes are never presented as working.
+Then:
+
+1. Grant camera permission.
+2. Wait for lens qualification to finish.
+3. Switch through every displayed rear/front lens and confirm live preview.
+4. Check that only genuinely useful lenses are shown.
+5. Check which lenses say **RAW verified**.
+6. Tap **Share diagnostics** and send the JSON report back to the project for analysis.
+
+The diagnostic report contains camera topology/build information but does not request network, storage, contacts, location, microphone, serial-number, IMEI or account permissions.
 
 ## Repository structure
 
 ```text
 Camera-Computaional/
 ├── app/                 # Compose UI and Android lifecycle/orchestration
-├── camera-core/         # Camera2 discovery and preview session control
+├── camera-core/         # Camera2 discovery, qualification, diagnostics, preview
 ├── aurora-core/         # C++20 NDK computational core foundation
 ├── docs/                # Architecture, roadmap, research input
-├── .github/workflows/   # CI
-├── PROJECT_STATE.md     # Handoff checkpoint for continued development
+├── .github/workflows/   # CI and debug APK artifact
+├── PROJECT_STATE.md     # Current engineering checkpoint
 └── README.md
 ```
 
-The longer-term architecture expands this into dedicated capture, format, Vulkan, AI, gallery, benchmark and device-profile modules. See `docs/ARCHITECTURE.md` and `docs/ROADMAP.md`.
+## Architecture invariant
 
-## Upload to the existing GitHub repository
+Where Camera2 exposes usable sensor RAW, **sensor RAW plus complete capture metadata is the source of truth**. JPEG/HEIF/OEM-rendered images must not become inputs to the canonical computational pipeline. Expensive image processing belongs in C++20/Vulkan; display tone, highlights, shadows, saturation and sharpening remain non-destructive render-recipe operations.
 
-The existing repository is:
-
-```text
-git@github.com:sahid-code404/Camera-Computaional.git
-```
-
-After extracting this project:
-
-```bash
-cd Camera-Computaional
-git init
-git add .
-git commit -m "feat: initialize Camera Aurora foundation"
-git branch -M main
-git remote add origin git@github.com:sahid-code404/Camera-Computaional.git
-git push -u origin main
-```
-
-If `origin` already exists:
-
-```bash
-git remote set-url origin git@github.com:sahid-code404/Camera-Computaional.git
-git push -u origin main
-```
-
-After the first push, development should continue on feature branches. The first recommended branch is `phase/01-foundation-discovery`.
+See `docs/ARCHITECTURE.md`, `docs/ROADMAP.md`, and `docs/RESEARCH_ARCHITECTURE_SOURCE.md`.

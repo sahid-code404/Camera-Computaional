@@ -2,67 +2,81 @@
 
 ## Repository
 
-Target GitHub repository: `sahid-code404/Camera-Computaional`
+GitHub: `sahid-code404/Camera-Computaional`
 
-> The repository name intentionally matches the existing GitHub repository spelling (`Computaional`).
+Active branch: `phase/01-foundation-discovery`
+
+Draft PR: `#1 — Phase 01: runtime lens/session qualification`
 
 ## Current milestone
 
-**Foundation / Phase 01**
+**Phase 01 — Foundation and lens qualification**
 
-This starter repository establishes the build, module boundaries, Camera2 discovery path, physical-camera preview routing, Jetpack Compose UI, C++20 NDK bridge, and CI skeleton.
+### Implemented in Phase 01
 
-### Implemented
+- Camera2 logical/physical candidate discovery.
+- Logical fallback candidate retained for logical multi-camera devices.
+- Dedicated `CameraSessionQualifier` on its own handler thread.
+- Real preview `CameraCaptureSession` configuration required before a lens is visible.
+- Preview + `RAW_SENSOR` session configuration is tested separately when RAW is advertised.
+- RAW badge is shown only when the runtime combination succeeds.
+- Physical outputs are routed through their logical parent with `OutputConfiguration.setPhysicalCameraId`.
+- API 35+ `CameraDeviceSetup.isSessionConfigurationSupported` is used as a fast negative gate, followed by an actual session configuration for evidence.
+- RAW probing is bounded to prevent pathological startup times.
+- Qualified physical members are preferred; a qualified logical stream is used when all physical members fail.
+- Accepted and rejected candidates are retained in `CameraQualificationReport`.
+- Qualification evidence is persisted by `Build.FINGERPRINT` for diagnostics; cache never bypasses fresh runtime qualification.
+- JSON capability/session diagnostic export added to the app.
+- UI exposes **Share diagnostics** for real-device testing.
+- Stable Phase 01 build stack moved to Android 16/API 36.
+- Compose/AndroidX versions pinned to API-36-compatible releases.
+- Gradle launcher now enforces the pinned Gradle 9.5.0 instead of silently using an arbitrary system Gradle.
+- GitHub Actions builds the debug APK, runs unit-test tasks, and uploads the APK artifact successfully.
 
-- Android app named **Camera**.
-- Kotlin + Jetpack Compose application layer.
-- Camera2-only public API baseline.
-- Capability-driven logical/physical lens discovery.
-- Filters out candidates without preview-compatible streams.
-- UI shows user-facing lenses instead of raw Camera2 numeric IDs.
-- Physical stream routing through a logical parent when Camera2 exposes it.
-- Correctly keeps RAW support as a per-lens capability rather than an assumption.
-- C++20 **Aurora** NDK module with JNI self-test.
-- No network permission.
-- No JPEG/HEIF capture or processing path in the foundation.
-- GitHub Actions build workflow.
+## CI checkpoint
 
-### Not implemented yet
+A complete GitHub Actions run on the Phase 01 branch passed:
 
-The shutter button is intentionally non-capturing in this foundation package. The following must be added in subsequent phases rather than faked:
+- Android SDK/NDK installation: pass
+- Debug APK build: pass
+- Unit-test tasks: pass
+- APK artifact upload: pass
 
-1. Verified session-combination qualification per lens and mode.
-2. Single RAW capture with metadata synchronization.
-3. DNG compatibility writer and canonical AURAW format.
-4. Bounded native RAW frame pool.
-5. Burst capture sequencer and adaptive exposure planner.
-6. Frame/tile quality scoring.
-7. RAW calibration, alignment, fusion, HDR, denoise, and physical SR.
-8. Vulkan compute backend.
-9. Night, Pro, Portrait, Panorama, RAW video/AURV, slow motion.
-10. Per-lens render recipes and persistent device profiles.
-11. Gallery/MediaStore output and background processing.
-12. Device laboratory and numerical image-quality regression gates.
+The branch remains unmerged because Phase 01 requires real-device evidence before the qualification gate is considered complete.
+
+## Current hardware gate
+
+The next required evidence must come from physical Android phones:
+
+1. Install the Phase 01 debug APK.
+2. Allow the startup qualification pass to finish.
+3. Verify live preview for every displayed rear/front lens.
+4. Check that useless/depth/duplicate/non-functional candidates are absent from normal UI.
+5. Record which lenses show `RAW verified`.
+6. Export **Share diagnostics** JSON and attach it to the project/test conversation.
+7. Use the report to fix OEM-specific session/topology edge cases.
+
+A Camera2 session that configures successfully is stronger evidence than static metadata, but Phase 01 may still be tightened further if device testing reveals cameras that configure yet fail to produce a stable live stream.
+
+## Phase 02 remains blocked
+
+Do **not** start normal photo output, HDR, burst fusion, Night, SR or AI until Phase 01 lens qualification is demonstrated on real hardware.
+
+Phase 02 begins with:
+
+- `ImageReader` `RAW_SENSOR` acquisition.
+- sensor-timestamp ↔ `TotalCaptureResult` synchronization.
+- immutable source RAW + full metadata record.
+- DNG compatibility export.
+- first AURAW container version.
+- MediaStore/output state.
 
 ## Non-negotiable engineering rules
 
 - Sensor RAW + complete metadata is the photographic source of truth where RAW is available.
-- Do not merge JPEG/HEIF or pretend vendor-rendered images are RAW.
-- Do not label synthetic resolution/FPS as hardware native.
-- Do not expose every Camera2 ID directly to the user.
-- Do not use hidden APIs, root, private CamX/CHI calls, copied proprietary camera code, or leaked vendor source in the universal build.
-- Keep expensive pixel processing in C++20/Vulkan, not Compose or Java/Kotlin heaps.
-- Canonical RAW remains non-destructive; tone, saturation, shadows, highlights and display sharpening live in a render recipe.
-
-## Next branch after upload
-
-Create: `phase/01-foundation-discovery`
-
-Recommended immediate work:
-
-1. Make the GitHub Action green.
-2. Install the debug APK on at least one physical phone.
-3. Record the discovered logical/physical lens topology.
-4. Validate every displayed lens by creating an actual preview+RAW session where RAW is advertised.
-5. Persist qualified capabilities keyed by build/camera fingerprint.
-6. Only then begin `phase/02-single-raw`.
+- Never merge JPEG/HEIF or label vendor-rendered output as RAW.
+- Never label synthetic resolution/FPS as native sensor output.
+- Never display raw Camera2 IDs directly to normal users.
+- Universal builds use documented Android SDK/NDK APIs only; no hidden APIs, root, private CamX/CHI calls, copied proprietary code or leaked vendor source.
+- Expensive pixel processing belongs in C++20/Vulkan, with bounded memory and CPU fallback.
+- Canonical RAW remains non-destructive; tone, saturation, shadows, highlights and display sharpening belong to a render recipe.
