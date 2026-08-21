@@ -1,0 +1,41 @@
+name: Apply Phase 01 AUX RAW Fix
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/apply-phase01-aux-raw.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch-phase01:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: phase/01-foundation-discovery
+          fetch-depth: 0
+
+      - name: Apply AUX RAW patch
+        run: python3 .github/scripts/apply_aux_raw_fix.py
+
+      - name: Validate
+        run: git diff --check && git diff --stat
+
+      - name: Commit to Phase 01
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- \
+            aurora-core/src/main/cpp/aurora_jni.cpp \
+            aurora-core/src/main/cpp/auto_hidden_metadata.cpp \
+            camera-core/src/main/java/com/sahid/camera/core/CameraCapabilityProbe.kt \
+            camera-core/src/main/java/com/sahid/camera/core/ProgressiveLensDiscovery.kt \
+            camera-core/src/main/java/com/sahid/camera/core/CameraSessionQualifier.kt \
+            app/src/main/java/com/sahid/camera/MainActivity.kt
+          git commit -m "fix: validate AUX RAW10 RAW16 RAW12 streams"
+          git push origin HEAD:phase/01-foundation-discovery
