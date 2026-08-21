@@ -39,3 +39,5 @@ jobs:
             app/src/main/java/com/sahid/camera/MainActivity.kt
           git commit -m "fix: validate AUX RAW10 RAW16 RAW12 streams"
           git push origin HEAD:phase/01-foundation-discovery
+
+# second commit intentionally triggers this workflow
