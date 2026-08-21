@@ -261,7 +261,20 @@ CameraRecord readCameraRecord(
     record.physicalIds = readPhysicalIds(metadata);
     record.privateOutputSizes = outputSizesForFormat(metadata, AIMAGE_FORMAT_PRIVATE);
     record.yuvOutputSizes = outputSizesForFormat(metadata, AIMAGE_FORMAT_YUV_420_888);
-    record.rawOutputSizes = outputSizesForFormat(metadata, AIMAGE_FORMAT_RAW16);
+    record.rawOutputSizes = outputSizesForFormat(metadata, AIMAGE_FORMAT_RAW10);
+    const auto raw16Sizes = outputSizesForFormat(metadata, AIMAGE_FORMAT_RAW16);
+    const auto raw12Sizes = outputSizesForFormat(metadata, AIMAGE_FORMAT_RAW12);
+    record.rawOutputSizes.insert(record.rawOutputSizes.end(), raw16Sizes.begin(), raw16Sizes.end());
+    record.rawOutputSizes.insert(record.rawOutputSizes.end(), raw12Sizes.begin(), raw12Sizes.end());
+    std::sort(record.rawOutputSizes.begin(), record.rawOutputSizes.end(), [](const NativeSize& left, const NativeSize& right) {
+        return static_cast<int64_t>(left.width) * left.height >
+               static_cast<int64_t>(right.width) * right.height;
+    });
+    record.rawOutputSizes.erase(
+        std::unique(record.rawOutputSizes.begin(), record.rawOutputSizes.end(), [](const NativeSize& left, const NativeSize& right) {
+            return left.width == right.width && left.height == right.height;
+        }),
+        record.rawOutputSizes.end());
     return record;
 }
 
