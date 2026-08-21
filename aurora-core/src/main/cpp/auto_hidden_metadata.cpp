@@ -210,7 +210,20 @@ Java_com_sahid_camera_aurora_AutoHiddenMetadataEnumerator_nativeScanJson(
             ACAMERA_REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA);
         const auto privateSizes = outputSizes(metadata, AIMAGE_FORMAT_PRIVATE);
         const auto yuvSizes = outputSizes(metadata, AIMAGE_FORMAT_YUV_420_888);
-        const auto rawSizes = outputSizes(metadata, AIMAGE_FORMAT_RAW16);
+        auto rawSizes = outputSizes(metadata, AIMAGE_FORMAT_RAW10);
+        const auto raw16Sizes = outputSizes(metadata, AIMAGE_FORMAT_RAW16);
+        const auto raw12Sizes = outputSizes(metadata, AIMAGE_FORMAT_RAW12);
+        rawSizes.insert(rawSizes.end(), raw16Sizes.begin(), raw16Sizes.end());
+        rawSizes.insert(rawSizes.end(), raw12Sizes.begin(), raw12Sizes.end());
+        std::sort(rawSizes.begin(), rawSizes.end(), [](const NativeSize& left, const NativeSize& right) {
+            return static_cast<int64_t>(left.width) * left.height >
+                   static_cast<int64_t>(right.width) * right.height;
+        });
+        rawSizes.erase(
+            std::unique(rawSizes.begin(), rawSizes.end(), [](const NativeSize& left, const NativeSize& right) {
+                return left.width == right.width && left.height == right.height;
+            }),
+            rawSizes.end());
         const auto children = physicalIds(metadata);
 
         if (!firstCamera) out << ',';

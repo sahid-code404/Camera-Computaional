@@ -311,9 +311,23 @@ Java_com_sahid_camera_aurora_NativeCameraEnumerator_nativeEnumerateJson(
             const auto yuvSizes = metadataStatus == ACAMERA_OK
                 ? outputSizesForFormat(metadata, AIMAGE_FORMAT_YUV_420_888)
                 : std::vector<NativeSize>{};
-            const auto rawSizes = metadataStatus == ACAMERA_OK
-                ? outputSizesForFormat(metadata, AIMAGE_FORMAT_RAW16)
-                : std::vector<NativeSize>{};
+            std::vector<NativeSize> rawSizes;
+            if (metadataStatus == ACAMERA_OK) {
+                rawSizes = outputSizesForFormat(metadata, AIMAGE_FORMAT_RAW10);
+                const auto raw16Sizes = outputSizesForFormat(metadata, AIMAGE_FORMAT_RAW16);
+                const auto raw12Sizes = outputSizesForFormat(metadata, AIMAGE_FORMAT_RAW12);
+                rawSizes.insert(rawSizes.end(), raw16Sizes.begin(), raw16Sizes.end());
+                rawSizes.insert(rawSizes.end(), raw12Sizes.begin(), raw12Sizes.end());
+                std::sort(rawSizes.begin(), rawSizes.end(), [](const NativeSize& left, const NativeSize& right) {
+                    return static_cast<int64_t>(left.width) * left.height >
+                           static_cast<int64_t>(right.width) * right.height;
+                });
+                rawSizes.erase(
+                    std::unique(rawSizes.begin(), rawSizes.end(), [](const NativeSize& left, const NativeSize& right) {
+                        return left.width == right.width && left.height == right.height;
+                    }),
+                    rawSizes.end());
+            }
 
             out << "{\"id\":\"" << jsonEscape(cameraId) << "\""
                 << ",\"characteristicsStatus\":" << static_cast<int>(metadataStatus)

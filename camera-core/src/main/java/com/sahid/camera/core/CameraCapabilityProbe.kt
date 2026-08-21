@@ -122,7 +122,7 @@ class CameraCapabilityProbe(context: Context) {
         val newCandidates = discovery.candidates.filter { it.cameraId !in learnedByCameraId }
         val qualifiedNew = CameraSessionQualifier(appContext).use { qualifier ->
             newCandidates.mapIndexed { index, lens ->
-                qualifier.qualifyPreviewOnly(lens).also {
+                qualifier.qualify(lens).also {
                     onProgress?.invoke(index + 1, newCandidates.size, it)
                 }
             }
@@ -524,10 +524,11 @@ class CameraCapabilityProbe(context: Context) {
             ?.getOutputSizes(ImageFormat.YUV_420_888)
             ?.toList()
             .orEmpty()
-        val javaRawSizes = streamMap
-            ?.getOutputSizes(ImageFormat.RAW_SENSOR)
-            ?.toList()
-            .orEmpty()
+        val javaRawSizes = mergeSizes(
+            streamMap?.getOutputSizes(ImageFormat.RAW10)?.toList().orEmpty(),
+            streamMap?.getOutputSizes(ImageFormat.RAW_SENSOR)?.toList().orEmpty(),
+            streamMap?.getOutputSizes(ImageFormat.RAW12)?.toList().orEmpty(),
+        )
 
         val fallbackPreviewSizes = if (allowMetadataLess) DEEP_FALLBACK_PREVIEW_SIZES else emptyList()
         val fallbackYuvSizes = if (allowMetadataLess) DEEP_FALLBACK_YUV_SIZES else emptyList()
@@ -552,7 +553,7 @@ class CameraCapabilityProbe(context: Context) {
             .orEmpty()
         val rawAdvertisedByJava =
             CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW in capabilities
-        val rawSupported = rawAdvertisedByJava || native?.rawCapability == true
+        val rawSupported = rawAdvertisedByJava || native?.rawCapability == true || rawSizes.isNotEmpty()
 
         val physicalSize = chars?.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
         val sensorWidthMm = physicalSize?.width ?: native?.sensorWidthMm

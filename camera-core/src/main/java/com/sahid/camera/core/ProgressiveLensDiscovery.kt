@@ -167,8 +167,11 @@ class ProgressiveLensDiscovery(context: Context) {
         val yuv = map.getOutputSizes(ImageFormat.YUV_420_888)
             ?.toList().orEmpty().sortedByDescending(::area)
         if (preview.isEmpty() && yuv.isEmpty()) return null
-        val raw = map.getOutputSizes(ImageFormat.RAW_SENSOR)
-            ?.toList().orEmpty().sortedByDescending(::area)
+        val raw = (
+            map.getOutputSizes(ImageFormat.RAW10)?.toList().orEmpty() +
+                map.getOutputSizes(ImageFormat.RAW_SENSOR)?.toList().orEmpty() +
+                map.getOutputSizes(ImageFormat.RAW12)?.toList().orEmpty()
+            ).distinct().sortedByDescending(::area)
         val capabilities = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
             ?.toSet().orEmpty()
         val sensor = chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
@@ -185,7 +188,7 @@ class ProgressiveLensDiscovery(context: Context) {
             sensorWidthMm = sensor?.width,
             sensorHeightMm = sensor?.height,
             horizontalFovDegrees = horizontalFov(sensor?.width, focal),
-            rawSupported = CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW in capabilities,
+            rawSupported = CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW in capabilities || raw.isNotEmpty(),
             rawSizes = raw,
             previewSizes = preview,
             yuvSizes = yuv,
@@ -219,7 +222,7 @@ class ProgressiveLensDiscovery(context: Context) {
             sensorWidthMm = native.sensorWidthMm,
             sensorHeightMm = native.sensorHeightMm,
             horizontalFovDegrees = horizontalFov(native.sensorWidthMm, native.focalLengthMm),
-            rawSupported = native.rawCapability,
+            rawSupported = native.rawCapability || native.rawOutputSizes.isNotEmpty(),
             rawSizes = native.rawOutputSizes.map { Size(it.width, it.height) },
             previewSizes = preview,
             yuvSizes = yuv,
@@ -255,7 +258,7 @@ class ProgressiveLensDiscovery(context: Context) {
             sensorWidthMm = info.sensorWidthMm,
             sensorHeightMm = info.sensorHeightMm,
             horizontalFovDegrees = horizontalFov(info.sensorWidthMm, info.focalLengthMm),
-            rawSupported = info.rawCapability,
+            rawSupported = info.rawCapability || info.rawOutputSizes.isNotEmpty(),
             rawSizes = info.rawOutputSizes.map { Size(it.width, it.height) },
             previewSizes = preview,
             yuvSizes = yuv,

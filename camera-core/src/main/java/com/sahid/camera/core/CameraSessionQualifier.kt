@@ -211,19 +211,23 @@ class CameraSessionQualifier(context: Context) : Closeable {
         val yuvQualified = yuvCheck?.supported == true
 
         var rawQualifiedSize: Size? = null
+        var rawQualifiedFormat: Int? = null
         var rawDetail = if (lens.rawSupported) "RAW frame not tested" else "RAW not advertised"
         if (lens.rawSupported) {
-            for (rawSize in boundedRawCandidates(lens.rawSizes)) {
-                val rawCheck = checkNativeImageFrame(
-                    cameraId = lens.cameraId,
-                    size = rawSize,
-                    format = ImageFormat.RAW_SENSOR,
-                    repeating = false,
-                )
-                rawDetail = rawCheck.detail
-                if (rawCheck.supported) {
-                    rawQualifiedSize = rawSize
-                    break
+            rawLoop@ for (rawSize in boundedRawCandidates(lens.rawSizes)) {
+                for (rawFormat in RAW_PROBE_FORMATS) {
+                    val rawCheck = checkNativeImageFrame(
+                        cameraId = lens.cameraId,
+                        size = rawSize,
+                        format = rawFormat,
+                        repeating = false,
+                    )
+                    rawDetail = "${rawFormatLabel(rawFormat)}: ${rawCheck.detail}"
+                    if (rawCheck.supported) {
+                        rawQualifiedSize = rawSize
+                        rawQualifiedFormat = rawFormat
+                        break@rawLoop
+                    }
                 }
             }
             if (lens.rawSizes.isEmpty()) rawDetail = "No RAW output size"
@@ -247,7 +251,7 @@ class CameraSessionQualifier(context: Context) : Closeable {
             }
             if (lens.rawSupported) {
                 if (rawQualifiedSize != null) {
-                    append("; RAW frame OK ${rawQualifiedSize.width}×${rawQualifiedSize.height}")
+                    append("; ${rawFormatLabel(rawQualifiedFormat ?: ImageFormat.RAW_SENSOR)} frame OK ${rawQualifiedSize.width}×${rawQualifiedSize.height}")
                 } else {
                     append("; RAW failed ($rawDetail)")
                 }
@@ -437,35 +441,56 @@ class CameraSessionQualifier(context: Context) : Closeable {
 
         var lastDetail = "RAW session not configured"
         for (rawSize in boundedRawCandidates(lens.rawSizes)) {
-            val primary = when {
-                previewSize != null -> checkSession(
-                    camera,
-                    lens,
-                    previewSize = previewSize,
-                    rawSize = rawSize,
-                ) to "preview+raw"
-                yuvSize != null -> checkSession(
-                    camera,
-                    lens,
-                    yuvSize = yuvSize,
-                    rawSize = rawSize,
-                ) to "yuv+raw"
-                else -> checkSession(camera, lens, rawSize = rawSize) to "raw-only"
-            }
-            lastDetail = primary.first.detail
-            if (primary.first.supported) {
-                return RawQualification(rawSize, primary.second, primary.first.detail)
-            }
-
-            if (previewSize != null || yuvSize != null) {
-                val standalone = checkSession(camera, lens, rawSize = rawSize)
-                lastDetail = standalone.detail
-                if (standalone.supported) {
-                    return RawQualification(rawSize, "raw-only", standalone.detail)
+            for (rawFormat in RAW_PROBE_FORMATS) {
+                val formatLabel = rawFormatLabel(rawFormat)
+                val primary = when {
+                    previewSize != null -> checkSession(
+                        camera,
+                        lens,
+                        previewSize = previewSize,
+                        rawSize = rawSize,
+                        rawFormat = rawFormat,
+                    ) to "preview+$formatLabel"
+                    yuvSize != null -> checkSession(
+                        camera,
+                        lens,
+                        yuvSize = yuvSize,
+                        rawSize = rawSize,
+                        rawFormat = rawFormat,
+                    ) to "yuv+$formatLabel"
+                    else -> checkSession(
+                        camera,
+                        lens,
+                        rawSize = rawSize,
+                        rawFormat = rawFormat,
+                    ) to "$formatLabel-only"
+                }
+                lastDetail = "$formatLabel: ${primary.first.detail}"
+                if (primary.first.supported) {
+                    return RawQualification(rawSize, primary.second, lastDetail)
+                }
+                if (previewSize != null || yuvSize != null) {
+                    val standalone = checkSession(
+                        camera,
+                        lens,
+                        rawSize = rawSize,
+                        rawFormat = rawFormat,
+                    )
+                    lastDetail = "$formatLabel: ${standalone.detail}"
+                    if (standalone.supported) {
+                        return RawQualification(rawSize, "$formatLabel-only", lastDetail)
+                    }
                 }
             }
         }
         return RawQualification(null, "none", lastDetail)
+    }
+
+    private fun rawFormatLabel(format: Int): String = when (format) {
+        ImageFormat.RAW10 -> "RAW10"
+        ImageFormat.RAW12 -> "RAW12"
+        ImageFormat.RAW_SENSOR -> "RAW16"
+        else -> "RAW($format)"
     }
 
     private fun chooseQualificationSize(sizes: List<Size>): Size? {
@@ -529,13 +554,14 @@ class CameraSessionQualifier(context: Context) : Closeable {
         previewSize: Size? = null,
         yuvSize: Size? = null,
         rawSize: Size? = null,
+        rawFormat: Int = ImageFormat.RAW_SENSOR,
         timeoutMs: Long = SESSION_TIMEOUT_MS,
     ): SessionCheck {
         if (previewSize == null && yuvSize == null && rawSize == null) {
             return SessionCheck(false, "No output supplied")
         }
 
-        val query = querySupportIfAvailable(lens, previewSize, yuvSize, rawSize)
+        val query = querySupportIfAvailable(lens, previewSize, yuvSize, rawSize, rawFormat)
         if (query == false) {
             return SessionCheck(false, "CameraDeviceSetup rejected configuration")
         }
@@ -558,7 +584,7 @@ class CameraSessionQualifier(context: Context) : Closeable {
         }
         val rawReader = rawSize?.let {
             runCatching {
-                ImageReader.newInstance(it.width, it.height, ImageFormat.RAW_SENSOR, 2)
+                ImageReader.newInstance(it.width, it.height, rawFormat, 2)
             }.getOrNull()
         }
 
@@ -634,6 +660,7 @@ class CameraSessionQualifier(context: Context) : Closeable {
         previewSize: Size?,
         yuvSize: Size?,
         rawSize: Size?,
+        rawFormat: Int,
     ): Boolean? {
         if (Build.VERSION.SDK_INT < 35) return null
 
@@ -658,7 +685,7 @@ class CameraSessionQualifier(context: Context) : Closeable {
                 }
             }
             rawSize?.let { size ->
-                outputs += OutputConfiguration(ImageFormat.RAW_SENSOR, size).apply {
+                outputs += OutputConfiguration(rawFormat, size).apply {
                     if (lens.accessPath == CameraAccessPath.PHYSICAL_VIA_LOGICAL) {
                         lens.physicalCameraId?.let(::setPhysicalCameraId)
                     }
@@ -705,5 +732,10 @@ class CameraSessionQualifier(context: Context) : Closeable {
         const val FAST_SESSION_TIMEOUT_MS = 1_500L
         const val FAST_FRAME_TIMEOUT_MS = 1_800L
         const val MAX_RAW_PROBES = 6
+        val RAW_PROBE_FORMATS = intArrayOf(
+            ImageFormat.RAW10,
+            ImageFormat.RAW_SENSOR,
+            ImageFormat.RAW12,
+        )
     }
 }

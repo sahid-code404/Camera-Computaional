@@ -294,7 +294,7 @@ private fun CameraScreen() {
                             lensScanBusy = true
                             val previousId = selectedLens?.cameraId
                             selectedLens = null
-                            status = "Deep compatibility rescan…"
+                            status = "Deep compatibility rescan + RAW10/16/12 validation…"
                             val report = withContext(Dispatchers.Default) {
                                 CameraCapabilityProbe(context).probeDeepQualificationReport()
                             }
@@ -440,9 +440,12 @@ private fun LensSelector(
                             append(" • ")
                             append(String.format("%.1fmm", it))
                         }
-                        if (lens.rawUsable) {
-                            append(" • RAW")
-                            qualifiedRaw?.let { append(" ${it.width}×${it.height}") }
+                        when {
+                            lens.rawUsable -> {
+                                append(" • RAW")
+                                qualifiedRaw?.let { append(" ${it.width}×${it.height}") }
+                            }
+                            lens.rawSupported -> append(" • RAW?")
                         }
                     },
                     color = if (isSelected) Color.DarkGray else Color.LightGray,
